@@ -263,6 +263,12 @@ class QueuePanel(QWidget):
     def _on_state_changed(self, state: str) -> None:
         jobs = db.get_all_jobs()
         self.queue_info_lbl.setText(f"Queue Status: {state} | Total Jobs: {len(jobs)}")
+        if state == "RUNNING":
+            self.btn_start.setEnabled(False)
+            self.btn_start.setText("Processing...")
+        else:
+            self.btn_start.setEnabled(True)
+            self.btn_start.setText("Start Processing")
 
     def load_jobs_from_db(self) -> None:
         jobs = db.get_all_jobs()

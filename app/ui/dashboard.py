@@ -280,6 +280,12 @@ class DashboardPanel(QWidget):
 
     def _on_queue_state_change(self, state: str) -> None:
         signals.status_message.emit(f"Queue State: {state}", 4000)
+        if state == "RUNNING":
+            self.btn_start.setEnabled(False)
+            self.btn_start.setText("Processing...")
+        else:
+            self.btn_start.setEnabled(True)
+            self.btn_start.setText("Start Processing")
 
     def _on_start_processing(self) -> None:
         if not browser_manager.is_running:

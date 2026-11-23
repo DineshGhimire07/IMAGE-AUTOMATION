@@ -22,19 +22,43 @@ class ImageProcessor:
     def __init__(self):
         self.last_performance_report: Dict[str, Any] = {}
 
-    async def process_job(self, job: JobItem, prompt_order: int, prompt_name: str) -> bool:
+    @staticmethod
+    def _is_markdown_job(job: JobItem, prompt_order: int, prompt_name: str) -> bool:
+        """Determines if a prompt is intended to produce a .md file instead of an image."""
+        name_lower = (prompt_name or "").lower()
+        text_lower = (job.prompt_text or "").lower()
+
+        md_indicators = [
+            "markdown", ".md", "seo generator", "seo + markdown", "seo specialist",
+            "daraz poster seo", "product listing in a downloadable", "yaml frontmatter"
+        ]
+        for ind in md_indicators:
+            if ind in name_lower or ind in text_lower:
+                return True
+
+        if prompt_order == 3 and any(k in text_lower for k in ("listing", "seo", "description", "daraz", "markdown")):
+            return True
+
+        return False
+
+    async def process_job(
+        self,
+        job: JobItem,
+        prompt_order: int,
+        prompt_name: str,
+        is_new_product: bool = True,
+    ) -> bool:
         """
         Executes generation workflow for one JobItem:
         1. Ensures browser page is ready on ChatGPT.
-        2. Copies original image safely into product folder structure.
-        3. Uploads original image (measures upload duration).
-        4. Submits prompt.
-        5. Observes generation completion (measures generation duration).
-        6. Captures download event or extracts high-res source (measures extraction duration).
-        7. Enqueues download task to asynchronous download workers.
+        2. If starting a new product: starts a clean chat and uploads original image.
+           If continuing the same product: reuses the chat without uploading the photo again.
+        3. Submits prompt.
+        4. Observes generation completion (is_markdown=True extracts .md, never photo).
+        5. Enqueues download task to asynchronous download workers.
         """
         t_job_start = time.perf_counter()
-        logger.info("=== Starting Execution for Job #%d ===", job.id)
+        logger.info("=== Starting Execution for Job #%d (Product Prompt %d) ===", job.id, prompt_order)
         signals.job_status_changed.emit(job.id, JobStatus.UPLOADING.value, "")
         db.update_job_status(job.id, JobStatus.UPLOADING)
 
@@ -54,10 +78,28 @@ class ImageProcessor:
         img_id_to_idx = {img.id: idx + 1 for idx, img in enumerate(all_imgs)}
         image_index = img_id_to_idx.get(job.image_id, job.image_id)
 
+        is_md = self._is_markdown_job(job, prompt_order, prompt_name)
+
         try:
-            # 1. Upload original image with high-resolution timing
-            t_upload_start = time.perf_counter()
-            upload_duration = await chatgpt_controller.upload_image(page, Path(job.image_path))
+            # 1. Image upload handling
+            if is_new_product:
+                # Start fresh chat session for new product
+                try:
+                    logger.info("Starting fresh chat session for new Product %02d (Job #%d)...", image_index, job.id)
+                    await page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=15000)
+                    await asyncio.sleep(1.0)
+                except Exception as nav_err:
+                    logger.debug("Page navigation to fresh chat: %s", nav_err)
+
+                t_upload_start = time.perf_counter()
+                upload_duration = await chatgpt_controller.upload_image(page, Path(job.image_path))
+            else:
+                # Continuing same product in the same chat: photo is already in chat!
+                logger.info(
+                    "Continuing Product %02d chat for Job #%d: Photo is already in chat, skipping re-upload.",
+                    image_index, job.id
+                )
+                upload_duration = 0.0
 
             # 2. Enter and submit prompt
             await chatgpt_controller.enter_and_submit_prompt(page, job.prompt_text)
@@ -70,13 +112,15 @@ class ImageProcessor:
             t_extract_start = time.perf_counter()
             success, image_results, err_msg, gen_duration = (
                 await chatgpt_controller.wait_for_generation_complete(
-                    page, timeout_seconds=config.generation_timeout_seconds
+                    page,
+                    timeout_seconds=config.generation_timeout_seconds,
+                    is_markdown=is_md,
                 )
             )
             extraction_duration = time.perf_counter() - t_extract_start
 
             if not success or not image_results:
-                err = err_msg or "Generation finished without detectable output image or download."
+                err = err_msg or ("Markdown generation failed" if is_md else "Image generation failed without detectable output")
                 logger.error("Job #%d failed: %s", job.id, err)
                 db.update_job_status(job.id, JobStatus.FAILED, error_message=err, increment_retry=True)
                 signals.job_status_changed.emit(job.id, JobStatus.FAILED.value, err)
@@ -101,7 +145,7 @@ class ImageProcessor:
                 md_content = res.get("content")
                 variant_label = f"v{i+1}" if is_multi else None
 
-                if res_type == "markdown":
+                if is_md or res_type == "markdown":
                     source_type = "markdown_text"
                 elif res_type == "file" or dl_obj:
                     source_type = "playwright_download"

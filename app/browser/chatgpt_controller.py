@@ -156,20 +156,25 @@ class ChatGPTController:
 
     @classmethod
     async def wait_for_generation_complete(
-        cls, page: Page, timeout_seconds: int = 240, poll_interval: float = 1.0
+        cls,
+        page: Page,
+        timeout_seconds: int = 240,
+        poll_interval: float = 1.0,
+        is_markdown: bool = False,
     ) -> Tuple[bool, list[dict[str, Any]], Optional[str], float]:
         """
         Observes generation lifecycle:
         1. Waits for generation to start (stop button or response streaming).
         2. Waits for stop button to disappear.
-        3. Scans for all newly rendered generated images in the assistant's turn (handles 1 or 2 options).
-        4. Attempts to trigger native Playwright expect_download() for highest-quality original image.
-        5. Detects any error alerts or generation timeouts.
-
-        Returns: (success: bool, image_results: list[dict], error_message: str | None, generation_duration: float)
-        where each dict in image_results contains {"src": str, "download": Download | None}
+        3. If is_markdown=True:
+           Extracts generated .md file or markdown text listing; NEVER downloads an image.
+        4. If is_markdown=False:
+           Scans for all newly rendered generated images in the assistant's turn (handles 1 or 2 options).
         """
-        logger.info("Waiting for generation to start and complete (timeout: %ds)...", timeout_seconds)
+        logger.info(
+            "Waiting for generation to start and complete (timeout: %ds, mode: %s)...",
+            timeout_seconds, "MARKDOWN" if is_markdown else "IMAGE"
+        )
         t_gen_start = time.perf_counter()
         generation_started = False
 
@@ -203,130 +208,140 @@ class ChatGPTController:
                     break
 
             if not is_still_generating:
-                # Generation finished: scan for generated outputs (images, downloadable files, markdown text)
-                img_candidates: list[tuple[Locator, str]] = []
-
-                # First check images inside the latest assistant message turn
-                assistant_turns = page.locator("[data-message-author-role='assistant']")
-                if await assistant_turns.count() > 0:
-                    turn_imgs = assistant_turns.last.locator("img")
-                    count = await turn_imgs.count()
-                    for idx in range(count):
-                        el = turn_imgs.nth(idx)
-                        if await el.is_visible():
-                            src_val = await el.get_attribute("src")
-                            if src_val and not src_val.startswith("data:image/svg"):
-                                img_candidates.append((el, src_val))
-
-                # Fallback to general selectors if assistant turn locator found nothing
-                if not img_candidates:
-                    for sel in selectors.generated_images:
-                        loc = page.locator(sel)
-                        cnt = await loc.count()
-                        if cnt > 0:
-                            candidate = loc.nth(cnt - 1)
-                            if await candidate.is_visible():
-                                src_val = await candidate.get_attribute("src")
-                                if src_val and not src_val.startswith("data:image/svg"):
-                                    img_candidates.append((candidate, src_val))
-                                    break
-
-                # Extract markdown / text content from assistant turn
-                md_content = ""
-                try:
-                    md_data = await page.evaluate("""() => {
-                        const turns = document.querySelectorAll("[data-message-author-role='assistant']");
-                        if (!turns || turns.length === 0) return { fullText: '', codeContent: '' };
-                        const turn = turns[turns.length - 1];
-
-                        const codeBlocks = turn.querySelectorAll('pre code');
-                        let codeContent = '';
-                        if (codeBlocks.length > 0) {
-                            const blocks = [];
-                            for (const cb of codeBlocks) {
-                                blocks.push(cb.innerText);
-                            }
-                            codeContent = blocks.join('\\n\\n');
-                        }
-
-                        const clone = turn.cloneNode(true);
-                        const removeEls = clone.querySelectorAll("button, [role='button'], svg, img, [class*='button']");
-                        removeEls.forEach(el => el.remove());
-                        const fullText = (clone.innerText || '').trim();
-
-                        return { fullText: fullText, codeContent: codeContent };
-                    }""")
-                    if md_data:
-                        md_content = md_data.get("codeContent") or md_data.get("fullText") or ""
-                except Exception as md_err:
-                    logger.debug("Markdown extraction evaluation failed: %s", md_err)
-
-                # Case 1: Image outputs detected
-                if img_candidates:
-                    gen_duration = time.perf_counter() - t_gen_start
-                    logger.info(
-                        "Generation finished in %.2fs. Detected %d image output(s).",
-                        gen_duration, len(img_candidates)
-                    )
-
-                    image_results: list[dict[str, Any]] = []
-                    for idx, (img_loc, src) in enumerate(img_candidates):
-                        # Hover over image to reveal download button overlay
+                # Generation finished: extract outputs
+                # -------------------------------------------------------------
+                # Branch A: Markdown Prompt Mode (Job is intended for .md file)
+                # -------------------------------------------------------------
+                if is_markdown:
+                    # Check for native file download button for a .md or text file
+                    file_download_obj: Optional[Download] = None
+                    file_dl_loc = page.locator("a[download*='.md'], a:has-text('.md'), button:has-text('Download'), [data-testid*='download']")
+                    if await file_dl_loc.count() > 0 and await file_dl_loc.first.is_visible():
                         try:
-                            await img_loc.hover(timeout=1000)
-                        except Exception:
-                            pass
-
-                        download_obj: Optional[Download] = None
-                        for dl_sel in selectors.download_buttons:
-                            dl_loc = page.locator(dl_sel)
-                            if await dl_loc.count() > 0 and await dl_loc.first.is_visible():
-                                try:
-                                    logger.info("Found native download button (%s). Triggering expect_download()...", dl_sel)
-                                    async with page.expect_download(timeout=6000) as dl_info:
-                                        await dl_loc.first.click()
-                                    download_obj = await dl_info.value
-                                    logger.info("Playwright download event captured: %s", download_obj.suggested_filename)
-                                    break
-                                except Exception as dl_err:
-                                    logger.warning("Download event trigger failed or timed out: %s. Using image URL fallback.", dl_err)
-                                    break
-
-                        image_results.append({
-                            "type": "image",
-                            "src": src,
-                            "download": download_obj,
-                        })
-
-                    return True, image_results, None, gen_duration
-
-                # Case 2: Markdown / Text or File prompt output detected (No image produced)
-                # Check for possible native download event / file link first
-                file_download_obj: Optional[Download] = None
-                for dl_sel in selectors.download_buttons:
-                    dl_loc = page.locator(dl_sel)
-                    if await dl_loc.count() > 0 and await dl_loc.first.is_visible():
-                        try:
-                            logger.info("Found file download button (%s) for text/file output.", dl_sel)
+                            logger.info("Found .md file download button. Triggering expect_download()...")
                             async with page.expect_download(timeout=5000) as dl_info:
-                                await dl_loc.first.click()
-                            file_download_obj = await dl_info.value
-                            break
-                        except Exception:
-                            pass
+                                await file_dl_loc.first.click()
+                            dl_val = await dl_info.value
+                            if dl_val.suggested_filename.lower().endswith((".md", ".txt", ".markdown")):
+                                file_download_obj = dl_val
+                        except Exception as e:
+                            logger.debug("File download expect failed: %s", e)
 
-                if file_download_obj or (md_content and len(md_content.strip()) >= 5):
-                    gen_duration = time.perf_counter() - t_gen_start
-                    logger.info(
-                        "Generation finished in %.2fs. Detected markdown/text output (%d chars).",
-                        gen_duration, len(md_content)
-                    )
-                    image_results = [{
-                        "type": "file" if file_download_obj else "markdown",
-                        "content": md_content.strip(),
-                        "download": file_download_obj,
-                    }]
-                    return True, image_results, None, gen_duration
+                    # Extract the full markdown text / YAML frontmatter from the assistant turn
+                    md_content = ""
+                    try:
+                        md_data = await page.evaluate("""() => {
+                            const turns = document.querySelectorAll("[data-message-author-role='assistant']");
+                            if (!turns || turns.length === 0) return { fullText: '', codeContent: '' };
+                            const turn = turns[turns.length - 1];
+
+                            const codeBlocks = turn.querySelectorAll('pre code');
+                            let codeContent = '';
+                            if (codeBlocks.length > 0) {
+                                const blocks = [];
+                                for (const cb of codeBlocks) {
+                                    blocks.push(cb.innerText);
+                                }
+                                codeContent = blocks.join('\\n\\n');
+                            }
+
+                            const clone = turn.cloneNode(true);
+                            const removeEls = clone.querySelectorAll("button, [role='button'], svg, img, [class*='button']");
+                            removeEls.forEach(el => el.remove());
+                            const fullText = (clone.innerText || '').trim();
+
+                            return { fullText: fullText, codeContent: codeContent };
+                        }""")
+                        if md_data:
+                            md_content = md_data.get("codeContent") or md_data.get("fullText") or ""
+                    except Exception as md_err:
+                        logger.debug("Markdown extraction evaluation failed: %s", md_err)
+
+                    if file_download_obj or (md_content and len(md_content.strip()) >= 5):
+                        gen_duration = time.perf_counter() - t_gen_start
+                        logger.info(
+                            "Generation finished in %.2fs. Captured Markdown output (%d chars).",
+                            gen_duration, len(md_content)
+                        )
+                        results = [{
+                            "type": "markdown",
+                            "content": md_content.strip(),
+                            "download": file_download_obj,
+                        }]
+                        return True, results, None, gen_duration
+
+                # -------------------------------------------------------------
+                # Branch B: Image Prompt Mode (Default: Job expects photo)
+                # -------------------------------------------------------------
+                else:
+                    img_candidates: list[tuple[Locator, str]] = []
+
+                    # First check images inside the latest assistant message turn
+                    assistant_turns = page.locator("[data-message-author-role='assistant']")
+                    if await assistant_turns.count() > 0:
+                        turn_imgs = assistant_turns.last.locator("img")
+                        count = await turn_imgs.count()
+                        for idx in range(count):
+                            el = turn_imgs.nth(idx)
+                            if await el.is_visible():
+                                src_val = await el.get_attribute("src")
+                                if src_val and not src_val.startswith("data:image/svg"):
+                                    img_candidates.append((el, src_val))
+
+                    # Fallback to general selectors if assistant turn locator found nothing
+                    if not img_candidates:
+                        for sel in selectors.generated_images:
+                            loc = page.locator(sel)
+                            cnt = await loc.count()
+                            if cnt > 0:
+                                candidate = loc.nth(cnt - 1)
+                                if await candidate.is_visible():
+                                    src_val = await candidate.get_attribute("src")
+                                    if src_val and not src_val.startswith("data:image/svg"):
+                                        img_candidates.append((candidate, src_val))
+                                        break
+
+                    if img_candidates:
+                        gen_duration = time.perf_counter() - t_gen_start
+                        logger.info(
+                            "Generation finished in %.2fs. Detected %d image output(s).",
+                            gen_duration, len(img_candidates)
+                        )
+
+                        image_results: list[dict[str, Any]] = []
+                        for idx, (img_loc, src) in enumerate(img_candidates):
+                            # Hover over image to reveal download button overlay
+                            try:
+                                await img_loc.hover(timeout=1000)
+                            except Exception:
+                                pass
+
+                            download_obj: Optional[Download] = None
+                            for dl_sel in selectors.download_buttons:
+                                dl_loc = page.locator(dl_sel)
+                                if await dl_loc.count() > 0 and await dl_loc.first.is_visible():
+                                    try:
+                                        logger.info("Found native download button (%s). Triggering expect_download()...", dl_sel)
+                                        async with page.expect_download(timeout=6000) as dl_info:
+                                            await dl_loc.first.click()
+                                        download_obj = await dl_info.value
+                                        logger.info("Playwright download event captured: %s", download_obj.suggested_filename)
+                                        break
+                                    except Exception as dl_err:
+                                        logger.warning("Download event trigger failed or timed out: %s. Using image URL fallback.", dl_err)
+                                        break
+
+                            image_results.append({
+                                "type": "image",
+                                "src": src,
+                                "download": download_obj,
+                            })
+
+                        return True, image_results, None, gen_duration
+
+            await asyncio.sleep(poll_interval)
+
+        return False, [], f"Generation timed out after {timeout_seconds} seconds.", time.perf_counter() - t_gen_start
 
             await asyncio.sleep(poll_interval)
 
