@@ -1,0 +1,12 @@
+{
+  "name": "xinvora-ai-studio",
+  "version": "1.0.0",
+  "description": "XINVORA AI Studio Desktop Application",
+  "scripts": {
+    "dev": "python3 main.py || python main.py",
+    "start": "python3 main.py || python main.py",
+    "test": "pytest tests/ -v"
+  },
+  "author": "XINVORA",
+  "license": "ISC"
+}
