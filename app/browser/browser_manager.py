@@ -118,27 +118,73 @@ class BrowserManager:
         logger.info("Browser context closed.")
 
     async def clear_composer_draft(self) -> None:
-        """Clears any residual uncommitted drafts saved by ChatGPT in localStorage/sessionStorage."""
+        """Clears any residual draft text from the ChatGPT composer.
+
+        ChatGPT stores drafts server-side and re-injects them into its ProseMirror
+        React-controlled textarea after every page load.  Direct DOM mutations
+        (innerHTML / innerText) are overwritten immediately by React's reconciler,
+        so we must use keyboard events that React actually listens to:
+            1. Wait until the textarea is visible (up to 10 s).
+            2. Click it to focus.
+            3. Ctrl+A  →  selects all text inside the editor.
+            4. Backspace →  deletes the selection (React processes this correctly).
+            5. Verify the textarea is empty; retry once if not.
+        """
         if not self.page or self.page.is_closed():
             return
+
+        TEXTAREA_SELECTORS = [
+            "#prompt-textarea",
+            "div[contenteditable='true'][id='prompt-textarea']",
+            "div[contenteditable='true'].ProseMirror",
+            "div[contenteditable='true']",
+        ]
+
+        async def _try_clear() -> bool:
+            for sel in TEXTAREA_SELECTORS:
+                try:
+                    loc = self.page.locator(sel).first
+                    if await loc.count() == 0:
+                        continue
+                    if not await loc.is_visible():
+                        continue
+                    await loc.click()
+                    await asyncio.sleep(0.2)
+                    # Select all + delete via keyboard so React processes the change
+                    await self.page.keyboard.press("Meta+a")   # macOS select-all
+                    await asyncio.sleep(0.1)
+                    await self.page.keyboard.press("Backspace")
+                    await asyncio.sleep(0.3)
+                    # Confirm it's empty
+                    text = await loc.inner_text()
+                    if text.strip():
+                        # Retry with Ctrl+A for non-macOS / fallback
+                        await self.page.keyboard.press("Control+a")
+                        await asyncio.sleep(0.1)
+                        await self.page.keyboard.press("Delete")
+                        await asyncio.sleep(0.3)
+                    logger.debug("Composer cleared via keyboard (selector: %s).", sel)
+                    return True
+                except Exception as ex:
+                    logger.debug("clear_composer_draft selector %s failed: %s", sel, ex)
+            return False
+
         try:
-            await self.page.evaluate("""() => {
-                try {
-                    const el = document.querySelector('#prompt-textarea');
-                    if (el) {
-                        el.innerHTML = '<p><br></p>';
-                        el.innerText = '';
-                    }
-                    for (let i = localStorage.length - 1; i >= 0; i--) {
-                        const k = localStorage.key(i);
-                        if (k && (k.toLowerCase().includes('draft') || k.toLowerCase().includes('composer') || k.toLowerCase().includes('prompt') || k.toLowerCase().includes('editor'))) {
-                            localStorage.removeItem(k);
-                        }
-                    }
-                    sessionStorage.clear();
-                } catch (e) {}
-            }""")
-            logger.debug("Cleared residual ChatGPT composer drafts.")
+            # Give ChatGPT up to 10 s to finish loading and injecting the draft
+            for _ in range(20):
+                for sel in TEXTAREA_SELECTORS:
+                    try:
+                        loc = self.page.locator(sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            await asyncio.sleep(0.3)   # let React finish rendering
+                            await _try_clear()
+                            logger.debug("Cleared residual ChatGPT composer draft.")
+                            return
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.5)
+
+            logger.debug("Composer textarea not found — draft clear skipped.")
         except Exception as e:
             logger.debug("Failed to clear composer drafts: %s", e)
 
@@ -169,12 +215,10 @@ class BrowserManager:
             target_url = "https://chatgpt.com/"
             logger.info("Navigating to %s (force_fresh=%s)...", target_url, force_fresh)
             await self.page.goto(target_url, timeout=timeout_ms, wait_until="domcontentloaded")
-            # Wait for ChatGPT's React app to boot and potentially restore its draft
-            await asyncio.sleep(2.5)
-            # Now wipe whatever draft ChatGPT may have restored
+            # clear_composer_draft now waits internally (up to 10 s) for the textarea
+            # to appear and for ChatGPT's server-side draft to be injected, then
+            # clears it via keyboard events that React actually processes.
             await self.clear_composer_draft()
-            # Small extra pause so the DOM is stable after the clear
-            await asyncio.sleep(0.5)
             return True
         except Exception as e:
             logger.error("Navigation to ChatGPT failed: %s", e)
