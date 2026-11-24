@@ -93,17 +93,8 @@ class ImageProcessor:
             t_upload_start = time.perf_counter()
             upload_duration = await chatgpt_controller.upload_image(page, img_file)
 
-            # 2. Enter and submit prompt
-            # For subsequent prompts, reinforce that ChatGPT must use the attached original product image
-            prompt_payload = job.prompt_text
-            if prompt_order > 1:
-                prompt_payload = (
-                    "[IMPORTANT INSTRUCTION: Use the attached original reference poster image as the sole source. "
-                    "Do NOT use, reference, or incorporate any previously generated room mockups, wall frames, or thumbnails from this chat.]\n\n"
-                    + prompt_payload
-                )
-
-            await chatgpt_controller.enter_and_submit_prompt(page, prompt_payload)
+            # 2. Enter and submit prompt strictly with user's exact prompt text
+            await chatgpt_controller.enter_and_submit_prompt(page, job.prompt_text)
 
             # 3. Transition to GENERATING
             db.update_job_status(job.id, JobStatus.GENERATING)

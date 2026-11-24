@@ -212,20 +212,58 @@ class ChatGPTController:
 
         # Focus input
         try:
-            await input_loc.click(timeout=3000)
+            await input_loc.click(timeout=1500)
         except Exception:
             logger.debug("Click on prompt input timed out, using direct focus.")
             await input_loc.focus()
 
-        # Fill prompt text with fallback
-        try:
-            await input_loc.fill(prompt_text)
-        except Exception as fill_err:
-            logger.debug("Locator fill failed (%s), falling back to keyboard insert_text", fill_err)
-            await input_loc.focus()
-            await page.keyboard.insert_text(prompt_text)
+        # Multi-strategy prompt entry for ChatGPT ProseMirror editor:
+        # Prevents newline characters from triggering early message submission.
+        filled = False
 
-        await asyncio.sleep(0.3)
+        # Strategy 1: Fast fill with short timeout
+        try:
+            await input_loc.fill(prompt_text, timeout=2000)
+            filled = True
+            logger.debug("Prompt filled via locator.fill")
+        except Exception as fill_err:
+            logger.debug("Locator fill bypassed or timed out (%s), using native paste event", fill_err)
+
+        # Strategy 2: Dispatch native clipboard paste event into ProseMirror (instantly pastes full multiline text)
+        if not filled:
+            try:
+                paste_ok = await page.evaluate("""(text) => {
+                    const el = document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
+                    if (!el) return false;
+                    el.focus();
+                    const dt = new DataTransfer();
+                    dt.setData('text/plain', text);
+                    const pasteEvent = new ClipboardEvent('paste', {
+                        clipboardData: dt,
+                        bubbles: true,
+                        cancelable: true
+                    });
+                    el.dispatchEvent(pasteEvent);
+                    return true;
+                }""", prompt_text)
+                if paste_ok:
+                    filled = True
+                    logger.debug("Prompt entered via simulated ClipboardEvent")
+            except Exception as paste_err:
+                logger.debug("ClipboardEvent entry failed: %s", paste_err)
+
+        # Strategy 3: Type line-by-line using Shift+Enter for newlines so Enter never submits prematurely
+        if not filled:
+            logger.debug("Falling back to line-by-line keyboard typing with Shift+Enter for newlines")
+            await input_loc.focus()
+            lines = prompt_text.split("\n")
+            for i, line in enumerate(lines):
+                if line:
+                    await page.keyboard.insert_text(line)
+                if i < len(lines) - 1:
+                    await page.keyboard.press("Shift+Enter")
+
+        await asyncio.sleep(0.4)
 
         # Locate send button with brief polling for enablement
         send_btn = None
