@@ -139,7 +139,7 @@ async def test_download_via_playwright_download_event():
 
 @pytest.mark.asyncio
 async def test_download_markdown_task():
-    """Verify that download queue processes generated markdown text and creates Product XX alias."""
+    """Verify that download queue processes generated markdown text and saves Prompt 3.md."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         batch_folder = tmp_path / "Batch 1 - 2026-11-23"
@@ -180,7 +180,6 @@ async def test_download_markdown_task():
         assert meta["detected_format"] == "MD"
         assert meta["file_size"] > 0
 
-        # Check Product 01.md alias also exists
+        # Verify no Product 01.md alias is created (only Prompt 3.md exists)
         alias_file = saved_path.parent / "Product 01.md"
-        assert alias_file.exists()
-        assert alias_file.read_text(encoding="utf-8") == md_text
+        assert not alias_file.exists()

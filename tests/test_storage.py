@@ -93,7 +93,7 @@ def test_output_naming_and_folder_structure(tmp_path):
 
 
 def test_atomic_save_part(tmp_path, sample_image):
-    """Verify atomic move from .part file to target destination, including .md alias."""
+    """Verify atomic move from .part file to target destination."""
     fm = FileManager(output_root=tmp_path)
     part_file = tmp_path / "temp.part"
     part_file.write_bytes(sample_image.read_bytes())
@@ -104,15 +104,14 @@ def test_atomic_save_part(tmp_path, sample_image):
     assert final_result.exists()
     assert final_result.name == "Prompt 1.png"
 
-    # Test markdown atomic save and Product 01.md alias creation
+    # Test markdown atomic save (no alias file created)
     part_md = tmp_path / "temp_md.part"
     part_md.write_text("# Test Title\n- Description bullet 1", encoding="utf-8")
     target_md = product_dir / "Prompt 3.md"
     final_md = fm.atomic_save_part(part_md, target_md)
     assert final_md.exists()
     assert final_md.name == "Prompt 3.md"
-    assert (product_dir / "Product 01.md").exists()
-    assert (product_dir / "Product 01.md").read_text(encoding="utf-8") == "# Test Title\n- Description bullet 1"
+    assert not (product_dir / "Product 01.md").exists()
 
     assert not part_file.exists()
     assert final_result.exists()
