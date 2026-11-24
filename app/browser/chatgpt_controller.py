@@ -215,11 +215,29 @@ class ChatGPTController:
         """
         logger.info("Entering prompt: '%s...'", prompt_text[:70])
 
-        input_loc = await cls.find_prompt_input(page, timeout_seconds=15.0)
+        # --- STEP 1: Dismiss overlays FIRST (banners can block input detection) ---
+        try:
+            await cls.dismiss_overlays(page)
+        except Exception:
+            pass
+
+        # --- STEP 2: Quick-find input (try immediately, skip 15s polling) ---
+        input_loc = None
+        for sel in selectors.prompt_input:
+            loc = page.locator(sel)
+            if await loc.count() > 0 and await loc.first.is_visible():
+                input_loc = loc.first
+                break
+
+        # Only fall back to full polling if quick find failed
         if not input_loc:
-            # Last-ditch: scroll to bottom and try again
+            input_loc = await cls.find_prompt_input(page, timeout_seconds=10.0)
+
+        # Last-ditch: scroll to bottom and retry
+        if not input_loc:
             try:
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(0.3)
                 await cls.dismiss_overlays(page)
                 for sel in selectors.prompt_input:
                     loc = page.locator(sel)
@@ -232,48 +250,62 @@ class ChatGPTController:
         if not input_loc:
             raise ChatGPTControllerError("ChatGPT prompt textarea could not be found.")
 
-        # Focus the input
+        # --- STEP 3: Focus without clearing (image attachment must be preserved!) ---
+        # DO NOT use fill(""), Control+a+Delete, or selectAll execCommand.
+        # Those remove the image attachment node from the ProseMirror editor.
+        # Instead: focus and move cursor to END so text appends AFTER the image.
         try:
             await input_loc.click(timeout=1500)
         except Exception:
             logger.debug("Click on prompt input timed out, using direct focus.")
             await input_loc.focus()
 
-        # Clear any existing content (previous failed attempt may have left residue)
+        # Move cursor to absolute END of editor (after any image attachment node)
         try:
-            await input_loc.fill("")
+            await page.evaluate("""
+                () => {
+                    const el = document.querySelector('#prompt-textarea') ||
+                               document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                               document.querySelector('[contenteditable="true"]');
+                    if (!el) return;
+                    el.focus();
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    range.collapse(false);
+                    const sel2 = window.getSelection();
+                    sel2.removeAllRanges();
+                    sel2.addRange(range);
+                }
+            """)
         except Exception:
-            try:
-                await page.keyboard.press("Control+a")
-                await page.keyboard.press("Delete")
-            except Exception:
-                pass
+            pass
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
 
-        # Insert text using execCommand — works with ProseMirror contenteditable editors.
-        # This is the ONLY method that correctly handles multiline text without
-        # triggering early Enter submission.
-        inserted = await page.evaluate("""(text) => {
-            const el = document.querySelector('#prompt-textarea') ||
-                       document.querySelector('[contenteditable="true"][role="textbox"]') ||
-                       document.querySelector('[contenteditable="true"]');
-            if (!el) return false;
-            el.focus();
-            // Select all existing content and replace with our text
-            document.execCommand('selectAll', false, null);
-            document.execCommand('delete', false, null);
-            return document.execCommand('insertText', false, text);
-        }""", prompt_text)
+        # --- STEP 4: Insert text at cursor (AFTER image, image node preserved) ---
+        inserted = await page.evaluate("""
+            (text) => {
+                const el = document.querySelector('#prompt-textarea') ||
+                           document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                           document.querySelector('[contenteditable="true"]');
+                if (!el) return false;
+                el.focus();
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                range.collapse(false);
+                const sel2 = window.getSelection();
+                sel2.removeAllRanges();
+                sel2.addRange(range);
+                return document.execCommand('insertText', false, text);
+            }
+        """, prompt_text)
 
         if not inserted:
-            # Fallback: Shift+Enter line-by-line typing (slower but reliable)
+            # Fallback: keyboard typing line by line (image attachment stays intact)
             logger.debug("execCommand did not insert text, falling back to line-by-line Shift+Enter")
             await input_loc.focus()
-            try:
-                await input_loc.fill("")
-            except Exception:
-                pass
+            # Move to end via keyboard (safe: does NOT remove image attachment)
+            await page.keyboard.press("End")
             lines = prompt_text.split("\n")
             for i, line in enumerate(lines):
                 if line:
@@ -281,7 +313,7 @@ class ChatGPTController:
                 if i < len(lines) - 1:
                     await page.keyboard.press("Shift+Enter")
         else:
-            logger.debug("Prompt inserted via execCommand")
+            logger.debug("Prompt inserted via execCommand (image attachment preserved)")
 
         await asyncio.sleep(0.5)
 
