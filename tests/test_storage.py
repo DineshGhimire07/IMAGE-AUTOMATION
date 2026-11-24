@@ -78,7 +78,7 @@ def test_output_naming_and_folder_structure(tmp_path):
 
     # Markdown output for prompt 3
     output_md = fm.get_output_target_path(batch_folder, 1, 3, ext=".md")
-    assert output_md.name == "Prompt 3.md"
+    assert output_md.name == "listing.md"
     assert output_md.parent.name == "Product 01"
 
     # Next product (Product 02)
@@ -107,10 +107,10 @@ def test_atomic_save_part(tmp_path, sample_image):
     # Test markdown atomic save (no alias file created)
     part_md = tmp_path / "temp_md.part"
     part_md.write_text("# Test Title\n- Description bullet 1", encoding="utf-8")
-    target_md = product_dir / "Prompt 3.md"
+    target_md = product_dir / "listing.md"
     final_md = fm.atomic_save_part(part_md, target_md)
     assert final_md.exists()
-    assert final_md.name == "Prompt 3.md"
+    assert final_md.name == "listing.md"
     assert not (product_dir / "Product 01.md").exists()
 
     assert not part_file.exists()

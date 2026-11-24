@@ -636,10 +636,11 @@ class ChatGPTController:
                                     const els = document.querySelectorAll(sel);
                                     if (els.length > 0) { turn = els[els.length - 1]; break; }
                                 }
-                                if (!turn) {
-                                    const main = document.querySelector('main') || document.body;
-                                    return (main.innerText || '').slice(-8000).trim();
-                                }
+                                if (!turn) {
+                                    // No assistant turn found — return empty string.
+                                    // Using main/body would grab user-sent prompt text too.
+                                    return '';
+                                }
                                 for (const code of turn.querySelectorAll('pre code')) {
                                     const t = code.innerText.trim();
                                     if (t.length > 50) return t;
@@ -659,10 +660,11 @@ class ChatGPTController:
                     md_valid = False
                     if md_content:
                         _mds = md_content.strip()
-                        md_valid = len(_mds) >= 50 and any(k in _mds for k in [
-                            "product_id:", "XINVORA", "seller_sku:",
-                            "special_price:", "highlights:", "---",
-                        ])
+                        # Must contain product_id: POSTER_ AND at least one more field
+                        # This rejects prompt text which only has XINVORA in the prompt body
+                        has_id = "product_id: POSTER_" in _mds or "product_id:POSTER_" in _mds
+                        has_sku = any(k in _mds for k in ["seller_sku:", "special_price:", "highlights:"])
+                        md_valid = len(_mds) >= 50 and has_id and has_sku
                     if file_download_obj or md_valid:
                         logger.info(
                             "MD done in %.2fs — file_downloaded=%s  text_chars=%d",

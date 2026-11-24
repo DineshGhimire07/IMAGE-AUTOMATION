@@ -175,7 +175,7 @@ async def test_download_markdown_task():
         job_id, saved_path, meta = success_results[0]
         assert job_id == 2001
         assert saved_path.exists()
-        assert saved_path.name == "Prompt 3.md"
+        assert saved_path.name == "listing.md"
         assert saved_path.parent.name == "Product 01"
         assert meta["detected_format"] == "MD"
         assert meta["file_size"] > 0
