@@ -193,7 +193,11 @@ class ImageProcessor:
                 variant_label = f"v{i+1}" if is_multi else None
 
                 if is_md or res_type == "markdown":
-                    source_type = "markdown_text"
+                    # Priority: use the downloaded file if captured, else DOM text
+                    if dl_obj:
+                        source_type = "playwright_download"
+                    else:
+                        source_type = "markdown_text"
                 elif res_type == "file" or dl_obj:
                     source_type = "playwright_download"
                 else:
