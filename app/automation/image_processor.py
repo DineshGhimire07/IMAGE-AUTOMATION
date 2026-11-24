@@ -98,22 +98,17 @@ class ImageProcessor:
 
         try:
             # ─────────────────────────────────────────────────────────────
-            # STEP 1: Upload image (ONLY for Prompt 1 of a new product)
+            # STEP 1: Upload photo for this prompt
+            # Every prompt (1, 2, 3) receives the product's source image attached,
+            # so ChatGPT always references the correct image for each step.
             # ─────────────────────────────────────────────────────────────
-            upload_duration = 0.0
-            if is_new_product and prompt_order == 1:
-                img_file = Path(job.image_path)
-                logger.info(
-                    "STEP 1 — Uploading source image for Product %02d (Job #%d): %s",
-                    image_index, job.id, img_file.name
-                )
-                upload_duration = await chatgpt_controller.upload_image(page, img_file)
-                logger.info("STEP 1 — Upload complete (%.2fs)", upload_duration)
-            else:
-                logger.info(
-                    "STEP 1 — Skipping upload (Prompt %d reuses image already in chat context).",
-                    prompt_order
-                )
+            img_file = Path(job.image_path)
+            logger.info(
+                "STEP 1 — Uploading source image for Product %02d (Job #%d, Prompt %d): %s",
+                image_index, job.id, prompt_order, img_file.name
+            )
+            upload_duration = await chatgpt_controller.upload_image(page, img_file)
+            logger.info("STEP 1 — Upload complete (%.2fs)", upload_duration)
 
             # ─────────────────────────────────────────────────────────────
             # STEP 2: Send prompt text (exact, unmodified)

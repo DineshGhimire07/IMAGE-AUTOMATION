@@ -136,6 +136,18 @@ class ChatGPTController:
         logger.info("Uploading image to ChatGPT: %s", image_path.name)
 
         try:
+            # Clear any previously attached files/pills in composer so only ONE image is attached
+            try:
+                remove_btns = page.locator("button[aria-label*='Remove'], button[aria-label*='Delete'], [data-testid*='attachment'] button, [data-testid*='close']")
+                cnt = await remove_btns.count()
+                for i in range(cnt):
+                    btn = remove_btns.nth(i)
+                    if await btn.is_visible():
+                        await btn.click(timeout=500)
+                        await asyncio.sleep(0.1)
+            except Exception:
+                pass
+
             # First strategy: look for hidden input[type="file"]
             file_input = page.locator("input[type='file']")
             if await file_input.count() > 0:
