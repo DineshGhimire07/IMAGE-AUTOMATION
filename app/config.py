@@ -34,7 +34,8 @@ class AppConfig:
     headless: bool = False
     browser_slow_mo_ms: int = 50
     page_load_timeout_ms: int = 60000
-    generation_timeout_seconds: int = 240
+    generation_timeout_seconds: int = 300    # Prompt 1 & 2 (image) timeout
+    markdown_timeout_seconds: int = 600      # Prompt 3 (.md file) timeout — ChatGPT is slower
     poll_interval_seconds: float = 1.5
 
     # Download & Worker settings

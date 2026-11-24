@@ -49,16 +49,31 @@ class ImageProcessor:
         is_new_product: bool = True,
     ) -> bool:
         """
-        Executes generation workflow for one JobItem:
-        1. Ensures browser page is ready on ChatGPT.
-        2. If starting a new product: starts a clean chat and uploads original image.
-           If continuing the same product: reuses the chat without uploading the photo again.
-        3. Submits prompt.
-        4. Observes generation completion (is_markdown=True extracts .md, never photo).
-        5. Enqueues download task to asynchronous download workers.
+        Executes ONE step in the pipeline for a single JobItem.
+
+        The pipeline follows this EXACT sequence per product:
+        ┌─────────────────────────────────────────────────────────┐
+        │  Prompt 1:  Upload photo  → Send Prompt 1 → Wait → Save  │
+        │  Prompt 2:  (no upload)   → Send Prompt 2 → Wait → Save  │
+        │  Prompt 3:  (no upload)   → Send Prompt 3 → Wait → Save .md │
+        │  Next product:                                            │
+        │  Prompt 1:  Upload photo2 → Send Prompt 1 → Wait → Save  │
+        │  ...                                                      │
+        └─────────────────────────────────────────────────────────┘
+
+        Rules:
+        - Image is uploaded ONLY for Prompt 1 of each product (is_new_product=True).
+        - Prompts 2 and 3 are sent as text ONLY inside the same chat; ChatGPT already
+          has the image in context.
+        - Prompt text is NEVER modified; it is sent exactly as stored in the library.
+        - Prompt 3 is detected as markdown; timeout is extended to 480 seconds for it.
         """
         t_job_start = time.perf_counter()
-        logger.info("=== Starting Execution for Job #%d (Product Prompt %d) ===", job.id, prompt_order)
+        logger.info(
+            "=== STEP START: Job #%d | Product Prompt %d ('%s') | New Product: %s ===",
+            job.id, prompt_order, prompt_name, is_new_product
+        )
+
         signals.job_status_changed.emit(job.id, JobStatus.UPLOADING.value, "")
         db.update_job_status(job.id, JobStatus.UPLOADING)
 
@@ -70,42 +85,64 @@ class ImageProcessor:
             signals.job_status_changed.emit(job.id, JobStatus.FAILED.value, err)
             return False
 
-        # Get or create active batch folder (Desktop/XInvora Photos/Batch N - Date)
         batch_folder = file_manager.get_or_create_batch_folder()
 
-        # Compute sequential product index (Product 1, Product 2, ... Product 50)
         all_imgs = db.get_all_images()
         img_id_to_idx = {img.id: idx + 1 for idx, img in enumerate(all_imgs)}
         image_index = img_id_to_idx.get(job.image_id, job.image_id)
 
         is_md = self._is_markdown_job(job, prompt_order, prompt_name)
 
+        # Markdown (Prompt 3) needs much more time — ChatGPT generates a file, not just text
+        timeout_seconds = config.markdown_timeout_seconds if is_md else config.generation_timeout_seconds
+
         try:
-            # 1. Image upload handling (stay strictly inside the single open chat session)
-            # Always attach the product's original source image for each prompt so ChatGPT
-            # exclusively analyzes and references the original photo, NEVER using a previously
-            # generated thumbnail/mockup!
-            img_file = Path(job.image_path)
+            # ─────────────────────────────────────────────────────────────
+            # STEP 1: Upload image (ONLY for Prompt 1 of a new product)
+            # ─────────────────────────────────────────────────────────────
+            upload_duration = 0.0
+            if is_new_product and prompt_order == 1:
+                img_file = Path(job.image_path)
+                logger.info(
+                    "STEP 1 — Uploading source image for Product %02d (Job #%d): %s",
+                    image_index, job.id, img_file.name
+                )
+                upload_duration = await chatgpt_controller.upload_image(page, img_file)
+                logger.info("STEP 1 — Upload complete (%.2fs)", upload_duration)
+            else:
+                logger.info(
+                    "STEP 1 — Skipping upload (Prompt %d reuses image already in chat context).",
+                    prompt_order
+                )
+
+            # ─────────────────────────────────────────────────────────────
+            # STEP 2: Send prompt text (exact, unmodified)
+            # ─────────────────────────────────────────────────────────────
             logger.info(
-                "Uploading original source image for Product %02d (Job #%d, Prompt %d): %s",
-                image_index, job.id, prompt_order, img_file.name
+                "STEP 2 — Sending Prompt %d for Product %02d (Job #%d): '%s...'",
+                prompt_order, image_index, job.id, job.prompt_text[:60]
             )
-            t_upload_start = time.perf_counter()
-            upload_duration = await chatgpt_controller.upload_image(page, img_file)
-
-            # 2. Enter and submit prompt strictly with user's exact prompt text
             await chatgpt_controller.enter_and_submit_prompt(page, job.prompt_text)
+            logger.info("STEP 2 — Prompt submitted.")
 
-            # 3. Transition to GENERATING
+            # ─────────────────────────────────────────────────────────────
+            # STEP 3: Transition status → GENERATING
+            # ─────────────────────────────────────────────────────────────
             db.update_job_status(job.id, JobStatus.GENERATING)
             signals.job_status_changed.emit(job.id, JobStatus.GENERATING.value, "")
+            logger.info(
+                "STEP 3 — Waiting for ChatGPT to generate (timeout: %ds, mode: %s)...",
+                timeout_seconds, "MARKDOWN" if is_md else "IMAGE"
+            )
 
-            # 4. Wait for generation to complete with high-res measurement
+            # ─────────────────────────────────────────────────────────────
+            # STEP 4: Wait for generation to complete
+            # ─────────────────────────────────────────────────────────────
             t_extract_start = time.perf_counter()
             success, image_results, err_msg, gen_duration = (
                 await chatgpt_controller.wait_for_generation_complete(
                     page,
-                    timeout_seconds=config.generation_timeout_seconds,
+                    timeout_seconds=timeout_seconds,
                     is_markdown=is_md,
                 )
             )
@@ -113,23 +150,27 @@ class ImageProcessor:
 
             if not success or not image_results:
                 err = err_msg or ("Markdown generation failed" if is_md else "Image generation failed without detectable output")
-                logger.error("Job #%d failed: %s", job.id, err)
+                logger.error("STEP 4 — Job #%d FAILED: %s", job.id, err)
                 db.update_job_status(job.id, JobStatus.FAILED, error_message=err, increment_retry=True)
                 signals.job_status_changed.emit(job.id, JobStatus.FAILED.value, err)
                 return False
 
-            # 5. Hand over to Download Manager (status: DOWNLOADING)
+            logger.info(
+                "STEP 4 — Generation complete in %.2fs. Got %d output(s).",
+                gen_duration, len(image_results)
+            )
+
+            # ─────────────────────────────────────────────────────────────
+            # STEP 5: Download & save output to product folder
+            # ─────────────────────────────────────────────────────────────
             db.update_job_status(job.id, JobStatus.DOWNLOADING)
             signals.job_status_changed.emit(job.id, JobStatus.DOWNLOADING.value, "")
+            logger.info(
+                "STEP 5 — Saving output(s) to Product %02d folder...",
+                image_index
+            )
 
             is_multi = len(image_results) > 1
-            if is_multi:
-                logger.info(
-                    "ChatGPT generated %d outputs for Job #%d! Enqueueing all to product folder.",
-                    len(image_results), job.id
-                )
-
-            # Enqueue all generated outputs (images, markdown files, file downloads)
             for i, res in enumerate(image_results):
                 res_type = res.get("type", "image")
                 dl_obj = res.get("download")
@@ -160,7 +201,6 @@ class ImageProcessor:
                 )
                 await download_manager.enqueue(download_task)
 
-            # Store preliminary timings
             total_duration_so_far = time.perf_counter() - t_job_start
             self.last_performance_report = {
                 "job_id": job.id,
@@ -172,8 +212,8 @@ class ImageProcessor:
             }
 
             logger.info(
-                "Job #%d Browser Phase Complete: Upload: %.2fs | Gen: %.2fs | Extract: %.2fs | Variants: %d | Browser Total: %.2fs",
-                job.id, upload_duration, gen_duration, extraction_duration, len(image_results), total_duration_so_far
+                "=== STEP DONE: Job #%d | Upload: %.2fs | Gen: %.2fs | Total: %.2fs ===",
+                job.id, upload_duration, gen_duration, total_duration_so_far
             )
             return True
 

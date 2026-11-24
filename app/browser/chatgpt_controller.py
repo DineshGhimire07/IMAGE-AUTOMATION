@@ -190,12 +190,22 @@ class ChatGPTController:
 
     @classmethod
     async def enter_and_submit_prompt(cls, page: Page, prompt_text: str) -> None:
-        """Enters prompt text into the composer and clicks Send with overlay auto-dismissal."""
-        logger.info("Entering prompt: '%s...'", prompt_text[:60])
+        """
+        Enters prompt text into the composer and clicks Send.
+
+        Strategy (in order):
+        1. Find and focus the input area (with 15s polling + modal dismissal).
+        2. Clear any existing content.
+        3. Insert text via document.execCommand('insertText') — the most reliable
+           method for ProseMirror / ContentEditable editors used by ChatGPT.
+        4. Verify the box actually has content before clicking Send.
+        5. Click Send button (or press Enter as fallback).
+        """
+        logger.info("Entering prompt: '%s...'", prompt_text[:70])
 
         input_loc = await cls.find_prompt_input(page, timeout_seconds=15.0)
         if not input_loc:
-            # One final scroll down attempt
+            # Last-ditch: scroll to bottom and try again
             try:
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await cls.dismiss_overlays(page)
@@ -210,62 +220,103 @@ class ChatGPTController:
         if not input_loc:
             raise ChatGPTControllerError("ChatGPT prompt textarea could not be found.")
 
-        # Focus input
+        # Focus the input
         try:
             await input_loc.click(timeout=1500)
         except Exception:
             logger.debug("Click on prompt input timed out, using direct focus.")
             await input_loc.focus()
 
-        # Multi-strategy prompt entry for ChatGPT ProseMirror editor:
-        # Prevents newline characters from triggering early message submission.
-        filled = False
-
-        # Strategy 1: Fast fill with short timeout
+        # Clear any existing content (previous failed attempt may have left residue)
         try:
-            await input_loc.fill(prompt_text, timeout=2000)
-            filled = True
-            logger.debug("Prompt filled via locator.fill")
-        except Exception as fill_err:
-            logger.debug("Locator fill bypassed or timed out (%s), using native paste event", fill_err)
-
-        # Strategy 2: Dispatch native clipboard paste event into ProseMirror (instantly pastes full multiline text)
-        if not filled:
+            await input_loc.fill("")
+        except Exception:
             try:
-                paste_ok = await page.evaluate("""(text) => {
-                    const el = document.querySelector('#prompt-textarea') || document.querySelector('[contenteditable="true"]');
-                    if (!el) return false;
-                    el.focus();
-                    const dt = new DataTransfer();
-                    dt.setData('text/plain', text);
-                    const pasteEvent = new ClipboardEvent('paste', {
-                        clipboardData: dt,
-                        bubbles: true,
-                        cancelable: true
-                    });
-                    el.dispatchEvent(pasteEvent);
-                    return true;
-                }""", prompt_text)
-                if paste_ok:
-                    filled = True
-                    logger.debug("Prompt entered via simulated ClipboardEvent")
-            except Exception as paste_err:
-                logger.debug("ClipboardEvent entry failed: %s", paste_err)
+                await page.keyboard.press("Control+a")
+                await page.keyboard.press("Delete")
+            except Exception:
+                pass
 
-        # Strategy 3: Type line-by-line using Shift+Enter for newlines so Enter never submits prematurely
-        if not filled:
-            logger.debug("Falling back to line-by-line keyboard typing with Shift+Enter for newlines")
+        await asyncio.sleep(0.2)
+
+        # Insert text using execCommand — works with ProseMirror contenteditable editors.
+        # This is the ONLY method that correctly handles multiline text without
+        # triggering early Enter submission.
+        inserted = await page.evaluate("""(text) => {
+            const el = document.querySelector('#prompt-textarea') ||
+                       document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                       document.querySelector('[contenteditable="true"]');
+            if (!el) return false;
+            el.focus();
+            // Select all existing content and replace with our text
+            document.execCommand('selectAll', false, null);
+            document.execCommand('delete', false, null);
+            return document.execCommand('insertText', false, text);
+        }""", prompt_text)
+
+        if not inserted:
+            # Fallback: Shift+Enter line-by-line typing (slower but reliable)
+            logger.debug("execCommand did not insert text, falling back to line-by-line Shift+Enter")
             await input_loc.focus()
+            try:
+                await input_loc.fill("")
+            except Exception:
+                pass
             lines = prompt_text.split("\n")
             for i, line in enumerate(lines):
                 if line:
                     await page.keyboard.insert_text(line)
                 if i < len(lines) - 1:
                     await page.keyboard.press("Shift+Enter")
+        else:
+            logger.debug("Prompt inserted via execCommand")
 
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.5)
 
-        # Locate send button with brief polling for enablement
+        # Verify that the input box actually has content before we Send.
+        # If the box is empty, do NOT click Send (would submit blank / just the image).
+        actual_content = ""
+        try:
+            actual_content = await page.evaluate("""() => {
+                const el = document.querySelector('#prompt-textarea') ||
+                           document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                           document.querySelector('[contenteditable="true"]');
+                return el ? (el.innerText || el.value || '').trim() : '';
+            }""") or ""
+        except Exception:
+            pass
+
+        if not actual_content:
+            logger.warning("Input box appears empty after prompt entry — trying clipboard paste fallback")
+            try:
+                await page.evaluate("""(text) => {
+                    const el = document.querySelector('#prompt-textarea') ||
+                               document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                               document.querySelector('[contenteditable="true"]');
+                    if (!el) return;
+                    el.focus();
+                    const dt = new DataTransfer();
+                    dt.setData('text/plain', text);
+                    el.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true}));
+                }""", prompt_text)
+                await asyncio.sleep(0.5)
+                actual_content = await page.evaluate("""() => {
+                    const el = document.querySelector('#prompt-textarea') ||
+                               document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                               document.querySelector('[contenteditable="true"]');
+                    return el ? (el.innerText || el.value || '').trim() : '';
+                }""") or ""
+            except Exception:
+                pass
+
+        if not actual_content:
+            raise ChatGPTControllerError(
+                "Prompt text could not be entered into ChatGPT input box — box is still empty after all strategies."
+            )
+
+        logger.debug("Input box verified with %d chars.", len(actual_content))
+
+        # Find and click the Send button (poll up to 4 seconds for it to enable)
         send_btn = None
         send_poll_start = time.perf_counter()
         while (time.perf_counter() - send_poll_start) < 4.0:
@@ -280,12 +331,11 @@ class ChatGPTController:
 
         if send_btn:
             await send_btn.click()
+            logger.info("Prompt submitted via Send button.")
         else:
-            # Fallback: Press Enter on the input
-            logger.debug("Send button not found or disabled, pressing Enter key.")
+            logger.debug("Send button not found — pressing Enter as fallback.")
             await input_loc.press("Enter")
-
-        logger.info("Prompt submitted successfully.")
+            logger.info("Prompt submitted via Enter key.")
 
     @staticmethod
     async def check_for_errors(page: Page) -> Optional[str]:
@@ -328,8 +378,10 @@ class ChatGPTController:
         t_gen_start = time.perf_counter()
         generation_started = False
 
-        # Phase 1: Wait up to 15s for generation to be marked active
-        while (time.perf_counter() - t_gen_start) < 15.0:
+        # Phase 1: Wait up to 20s for generation to be marked active (stop button appears)
+        # Markdown prompts may take longer to start processing after submission
+        phase1_timeout = 20.0
+        while (time.perf_counter() - t_gen_start) < phase1_timeout:
             err = await cls.check_for_errors(page)
             if err:
                 return False, [], f"ChatGPT Error: {err}", time.perf_counter() - t_gen_start
@@ -345,6 +397,8 @@ class ChatGPTController:
             await asyncio.sleep(0.5)
 
         # Phase 2: Monitor until generation completes
+        # If generation never started (phase 1 timed out without stop button),
+        # we still enter phase 2 to check if content appeared immediately.
         while (time.perf_counter() - t_gen_start) < timeout_seconds:
             err = await cls.check_for_errors(page)
             if err:
@@ -357,7 +411,11 @@ class ChatGPTController:
                     is_still_generating = True
                     break
 
-            if not is_still_generating:
+            # Only check for outputs once generation_started flag was set OR after phase 1 timeout.
+            # This prevents triggering extraction before ChatGPT even starts.
+            can_extract = generation_started or (time.perf_counter() - t_gen_start) > 20.0
+
+            if not is_still_generating and can_extract:
                 # Generation finished: extract outputs
                 # -------------------------------------------------------------
                 # Branch A: Markdown Prompt Mode (Job is intended for .md file)
@@ -367,13 +425,13 @@ class ChatGPTController:
                     if await assistant_turns.count() > 0:
                         last_turn_loc = assistant_turns.last
 
-                        # Check for native file download link strictly inside this latest assistant turn
+                        # Try to find a native .md file download link
                         file_download_obj: Optional[Download] = None
                         file_dl_loc = last_turn_loc.locator("a[download], a[href*='download'], a:has-text('.md')")
                         if await file_dl_loc.count() > 0 and await file_dl_loc.first.is_visible():
                             try:
                                 logger.info("Found .md file download link in latest turn. Triggering expect_download()...")
-                                async with page.expect_download(timeout=4000) as dl_info:
+                                async with page.expect_download(timeout=8000) as dl_info:
                                     await file_dl_loc.first.click()
                                 dl_val = await dl_info.value
                                 if dl_val.suggested_filename.lower().endswith((".md", ".txt", ".markdown")):
@@ -381,7 +439,8 @@ class ChatGPTController:
                             except Exception as dl_err:
                                 logger.debug("File download expect failed: %s", dl_err)
 
-                        # Extract clean markdown text directly from the latest assistant turn
+                        # Extract clean markdown text from the latest assistant turn.
+                        # Handles: code blocks (```yaml...```), plain text, prose containers.
                         md_content = ""
                         try:
                             md_content = await page.evaluate("""() => {
@@ -389,20 +448,24 @@ class ChatGPTController:
                                 if (!turns || turns.length === 0) return '';
                                 const turn = turns[turns.length - 1];
 
-                                // 1. Check if formatted in code block (e.g. ```markdown ... ```)
-                                const code = turn.querySelector('pre code');
-                                if (code && code.innerText.trim().length > 20) {
-                                    return code.innerText.trim();
+                                // Priority 1: code block content (```yaml / ```markdown)
+                                const codeBlocks = turn.querySelectorAll('pre code');
+                                for (const code of codeBlocks) {
+                                    const t = code.innerText.trim();
+                                    if (t.length > 50) return t;
                                 }
 
-                                // 2. Extract from markdown container
-                                const mdContainer = turn.querySelector('.markdown') || turn.querySelector('[class*="prose"]') || turn;
-                                return (mdContainer.innerText || '').trim();
+                                // Priority 2: markdown / prose container
+                                const mdContainer = turn.querySelector('.markdown') ||
+                                                   turn.querySelector('[class*="prose"]') ||
+                                                   turn;
+                                const text = (mdContainer.innerText || '').trim();
+                                return text.length > 50 ? text : '';
                             }""") or ""
                         except Exception as md_err:
                             logger.debug("Markdown extraction evaluation failed: %s", md_err)
 
-                        if file_download_obj or (md_content and len(md_content.strip()) >= 10):
+                        if file_download_obj or (md_content and len(md_content.strip()) >= 20):
                             gen_duration = time.perf_counter() - t_gen_start
                             logger.info(
                                 "Generation finished in %.2fs. Successfully captured Markdown output (%d chars).",
