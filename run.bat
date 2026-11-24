@@ -12,27 +12,46 @@ echo ========================================================
 echo  Launching XINVORA AI Studio...
 echo ========================================================
 
-REM Check if virtual environment exists
-if not exist ".venv\Scripts\activate.bat" (
-    echo [ERROR] Virtual environment (.venv) was not found!
-    echo Please run the following setup commands:
-    echo   python -m venv .venv
-    echo   .venv\Scripts\activate
-    echo   pip install -r requirements.txt
-    echo   python -m playwright install chromium
+REM Check if Python is installed on system
+python --version >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Python is not installed or not added to PATH!
+    echo Please install Python (3.11 or 3.12 recommended) from:
+    echo   https://www.python.org/downloads/
+    echo *IMPORTANT*: Check "Add python.exe to PATH" during installation!
     pause
     exit /b 1
 )
 
-REM Activate virtual environment
-call .venv\Scripts\activate.bat
+REM If virtual environment does not exist, set it up automatically on first run
+if not exist ".venv\Scripts\activate.bat" (
+    echo.
+    echo [SETUP] First-time setup detected. Configuring environment...
+    echo [1/3] Creating virtual environment (.venv)...
+    python -m venv .venv
+    if errorlevel 1 (
+        echo [ERROR] Failed to create .venv.
+        pause
+        exit /b 1
+    )
 
-REM Verify python interpreter in venv
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo [ERROR] Python failed to initialize from virtual environment.
-    pause
-    exit /b 1
+    echo [2/3] Installing required packages from requirements.txt...
+    call .venv\Scripts\activate.bat
+    python -m pip install --upgrade pip
+    pip install -r requirements.txt
+    if errorlevel 1 (
+        echo [ERROR] Failed to install dependencies.
+        pause
+        exit /b 1
+    )
+
+    echo [3/3] Installing Playwright Chromium browser...
+    python -m playwright install chromium
+    echo.
+    echo [SETUP COMPLETE] Environment configured successfully!
+    echo.
+) else (
+    call .venv\Scripts\activate.bat
 )
 
 REM Launch Main Application
