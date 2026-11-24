@@ -224,7 +224,9 @@ class BrowserPanel(QWidget):
                 await browser_manager.launch(headless=config.headless)
                 self._append_log("Dedicated browser context successfully launched.")
                 signals.browser_log.emit("Navigating to ChatGPT home page...")
-                await browser_manager.navigate_to_chatgpt()
+                # force_fresh=True: always reload chatgpt.com so the persistent
+                # session does NOT restore a stale draft from the previous run.
+                await browser_manager.navigate_to_chatgpt(force_fresh=True)
                 await self._async_test_connection()
             except Exception as e:
                 self._append_log(f"Error launching browser: {e}")

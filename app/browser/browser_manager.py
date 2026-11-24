@@ -142,22 +142,39 @@ class BrowserManager:
         except Exception as e:
             logger.debug("Failed to clear composer drafts: %s", e)
 
-    async def navigate_to_chatgpt(self, timeout_ms: int = 60000) -> bool:
-        """Navigates to ChatGPT home URL and clears any residual composer drafts."""
+    async def navigate_to_chatgpt(self, timeout_ms: int = 60000, force_fresh: bool = False) -> bool:
+        """Navigates to ChatGPT home URL and clears any residual composer drafts.
+
+        Args:
+            force_fresh: If True, always reload the page even if already on chatgpt.com.
+                         Use on first launch so the browser does NOT restore a stale draft
+                         from the previous session.
+        """
         if not self.is_running or not self.page:
             raise RuntimeError("Browser is not running.")
 
         try:
             current_url = self.page.url
-            if "chatgpt.com" in current_url:
-                logger.debug("Already on ChatGPT domain (%s)", current_url)
+            already_on_chatgpt = "chatgpt.com" in current_url
+
+            if already_on_chatgpt and not force_fresh:
+                # Already on ChatGPT and not a forced reload — just wipe composer
+                logger.debug("Already on ChatGPT domain (%s), clearing draft only.", current_url)
                 await self.clear_composer_draft()
                 return True
 
-            logger.info("Navigating to %s...", config.chatgpt_url)
-            await self.page.goto(config.chatgpt_url, timeout=timeout_ms, wait_until="domcontentloaded")
-            await asyncio.sleep(1.0)
+            # Either not on ChatGPT yet, or force_fresh=True → navigate to a clean home page.
+            # Always navigate to the root URL so ChatGPT opens a *new* chat and
+            # does NOT re-hydrate any old conversation draft from session-restore.
+            target_url = "https://chatgpt.com/"
+            logger.info("Navigating to %s (force_fresh=%s)...", target_url, force_fresh)
+            await self.page.goto(target_url, timeout=timeout_ms, wait_until="domcontentloaded")
+            # Wait for ChatGPT's React app to boot and potentially restore its draft
+            await asyncio.sleep(2.5)
+            # Now wipe whatever draft ChatGPT may have restored
             await self.clear_composer_draft()
+            # Small extra pause so the DOM is stable after the clear
+            await asyncio.sleep(0.5)
             return True
         except Exception as e:
             logger.error("Navigation to ChatGPT failed: %s", e)
