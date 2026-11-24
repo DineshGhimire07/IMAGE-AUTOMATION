@@ -439,140 +439,191 @@ class ChatGPTController:
                 # Branch A: Markdown Prompt Mode (Job is intended for .md file)
                 # -------------------------------------------------------------
                 if is_markdown:
-                    # Always scroll to bottom first — ChatGPT may not auto-scroll
-                    # after a long generation, so the document card is off-screen.
-                    try:
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    file_download_obj: Optional[Download] = None
+                    md_content = ""
+
+                    # ══ PHASE 1: Scroll the ChatGPT conversation to the bottom ══
+                    # ChatGPT uses its own overflow scroll container, not window.
+                    # We try every possible scroll container + End key + scrollIntoView.
+                    logger.info("Scrolling ChatGPT to bottom to reveal .md document card...")
+                    for _scroll_attempt in range(3):
+                        try:
+                            await page.evaluate("""
+                                () => {
+                                    // 1. Scroll every overflow container to its bottom
+                                    document.querySelectorAll(
+                                        'main, [role="main"], div[class*="overflow-y"], ' +
+                                        'div[class*="scroll"], div[class*="Scroll"]'
+                                    ).forEach(el => {
+                                        try { el.scrollTop = el.scrollHeight; } catch(e) {}
+                                    });
+                                    // 2. Scroll window too
+                                    window.scrollTo(0, document.body.scrollHeight);
+                                }
+                            """)
+                            await page.keyboard.press("End")
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.0)
+
+                    # Extra 3s gap after scroll so the card fully renders
+                    logger.info("Waiting 3s after scroll for .md card to fully render...")
+                    await asyncio.sleep(3.0)
+
+                    # ══ PHASE 2: Use JS to find the card, scroll it into view, return coords ══
+                    card_info = await page.evaluate("""
+                        () => {
+                            const turns = document.querySelectorAll("[data-message-author-role='assistant']");
+                            if (!turns.length) return null;
+                            const lastTurn = turns[turns.length - 1];
+
+                            // Gather every element in the last turn
+                            const candidates = Array.from(lastTurn.querySelectorAll('*'));
+                            for (const el of candidates) {
+                                const text = el.innerText || el.textContent || '';
+                                // Card has 'Open file' label OR a filename ending in .md
+                                const looksLikeCard = (
+                                    text.includes('Open file') ||
+                                    text.includes('Document') ||
+                                    /\\.md$/.test(text.trim()) ||
+                                    /\\.md\\b/.test(text)
+                                );
+                                if (!looksLikeCard) continue;
+
+                                const rect = el.getBoundingClientRect();
+                                // Card-sized: at least 100px wide, between 30 and 150px tall
+                                if (rect.width < 100 || rect.height < 20 || rect.height > 200) continue;
+                                // Must be visible on screen (or just below)
+                                if (rect.bottom < -50) continue;
+
+                                // Scroll the card to the vertical center of the viewport
+                                el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                const r2 = el.getBoundingClientRect();
+                                return {
+                                    centerX: r2.left + r2.width / 2,
+                                    centerY: r2.top  + r2.height / 2,
+                                    // Right edge minus 30px = where the ↓ button lives
+                                    btnX: r2.right - 30,
+                                    btnY: r2.top  + r2.height / 2,
+                                };
+                            }
+                            return null;
+                        }
+                    """)
+
+                    if card_info:
+                        cx = card_info["centerX"]
+                        cy = card_info["centerY"]
+                        bx = card_info["btnX"]
+                        by = card_info["btnY"]
+                        logger.info(
+                            "Found .md card at (%.0f, %.0f); download btn ~(%.0f, %.0f)",
+                            cx, cy, bx, by
+                        )
+
+                        # ══ PHASE 3: Real mouse-hover to trigger the CSS :hover state ══
+                        # Playwright's .hover() calls page.mouse.move() internally — but
+                        # we do it explicitly so we can control the exact coordinates.
+                        await page.mouse.move(cx, cy)   # enter the card
+                        await asyncio.sleep(1.0)         # wait for :hover CSS to fire
+                        await page.mouse.move(bx, by)   # slide to where ↓ button appears
                         await asyncio.sleep(0.8)
-                    except Exception:
-                        pass
 
-                    assistant_turns = page.locator("[data-message-author-role='assistant']")
-                    if await assistant_turns.count() > 0:
-                        last_turn_loc = assistant_turns.last
-                        file_download_obj: Optional[Download] = None
-
-                        # ── Strategy 1: Hover document card → click the ↓ download button ──
-                        # ChatGPT renders .md files as a card like:
-                        #   [🗒 XINVORA_...Poster.md  Open file]  [↓]
-                        # The ↓ download button on the RIGHT of the card is revealed on hover.
-                        # We do NOT need to open a preview panel — just hover & click ↓.
-                        doc_card_selectors = [
-                            "[data-testid*='document']",
-                            "[data-testid*='file-attachment']",
-                            "[data-testid*='attachment']",
-                            "div[class*='document']",
-                            "div[class*='Document']",
-                            "div[class*='artifact']",
-                            "div[class*='Artifact']",
-                            # Card identified by filename suffix
-                            "div:has(> span:has-text('.md'))",
-                            "div:has(span:has-text('Open file'))",
-                            "div:has(span:has-text('Document'))",
-                        ]
-                        for card_sel in doc_card_selectors:
+                        # ══ PHASE 4: Try every download mechanism ══
+                        # 4a — aria-label button (should now be visible after hover)
+                        for dl_aria in [
+                            "button[aria-label*='Download']",
+                            "button[aria-label*='download']",
+                            "button[title*='Download']",
+                            "button[title*='download']",
+                            "[data-testid*='download']",
+                        ]:
                             if file_download_obj:
                                 break
                             try:
-                                card_loc = last_turn_loc.locator(card_sel).first
-                                if await card_loc.count() == 0 or not await card_loc.is_visible():
-                                    continue
-                                logger.info("Found .md document card (%s) — hovering to reveal ↓ button...", card_sel)
-                                await card_loc.hover(timeout=2000)
-                                await asyncio.sleep(0.5)   # wait for hover-reveal animation
+                                dl_loc = page.locator(dl_aria).first
+                                if await dl_loc.count() > 0 and await dl_loc.is_visible():
+                                    logger.info("Clicking aria download button (%s)...", dl_aria)
+                                    async with page.expect_download(timeout=15000) as dl_info:
+                                        await dl_loc.click(timeout=3000)
+                                    file_download_obj = await dl_info.value
+                                    logger.info("Download captured: %s", file_download_obj.suggested_filename)
+                            except Exception as e:
+                                logger.debug("aria download btn %s: %s", dl_aria, e)
 
-                                # The download button is INSIDE or ADJACENT to the card
-                                # Try scoped search first (inside card), then whole-page fallback
-                                dl_btn_selectors = [
-                                    "button[aria-label*='Download']",
-                                    "button[aria-label*='download']",
-                                    "button[title*='Download']",
-                                    "button[title*='download']",
-                                    "[data-testid*='download']",
-                                    "a[download]",
-                                ]
-                                for dl_sel in dl_btn_selectors:
-                                    try:
-                                        # Try scoped first
-                                        dl_loc = card_loc.locator(dl_sel).first
-                                        if await dl_loc.count() == 0 or not await dl_loc.is_visible():
-                                            # Try whole page (button may be rendered outside card DOM)
-                                            dl_loc = page.locator(dl_sel).first
-                                        if await dl_loc.count() > 0 and await dl_loc.is_visible():
-                                            logger.info("Clicking ↓ download button (%s) on card...", dl_sel)
-                                            async with page.expect_download(timeout=12000) as dl_info:
-                                                await dl_loc.click(timeout=3000)
-                                            dl_val = await dl_info.value
-                                            logger.info("Download captured from card button: %s", dl_val.suggested_filename)
-                                            file_download_obj = dl_val
-                                            break
-                                    except Exception as dl_err:
-                                        logger.debug("Card download button %s failed: %s", dl_sel, dl_err)
-                                if file_download_obj:
-                                    break
-                            except Exception as card_err:
-                                logger.debug("Card selector %s failed: %s", card_sel, card_err)
-
-                        # ── Strategy 2: Click the inline "Download …md ↗" text link ──
-                        # ChatGPT often renders a plain text link above the card:
-                        #   "Markdown File: Download XINVORA_...md ↗"
+                        # 4b — click at the exact coordinates where the ↓ button lives
                         if not file_download_obj:
                             try:
-                                # Scroll & look for the link anywhere in the last turn
-                                link_loc = last_turn_loc.locator(
-                                    "a[href*='.md'], a:has-text('.md'), a[download]"
+                                logger.info("Clicking at card right-edge coordinates (%.0f, %.0f)...", bx, by)
+                                async with page.expect_download(timeout=15000) as dl_info:
+                                    await page.mouse.click(bx, by)
+                                file_download_obj = await dl_info.value
+                                logger.info("Download captured via coordinate click: %s",
+                                            file_download_obj.suggested_filename)
+                            except Exception as e:
+                                logger.debug("Coordinate click download: %s", e)
+                    else:
+                        logger.warning("Could not locate .md document card in page DOM.")
+
+                    # ══ PHASE 5: Text-link fallback ══
+                    # ChatGPT prints "Markdown File: Download …md ↗" as a plain <a> link
+                    if not file_download_obj:
+                        try:
+                            assistant_turns_loc = page.locator("[data-message-author-role='assistant']")
+                            if await assistant_turns_loc.count() > 0:
+                                last_t = assistant_turns_loc.last
+                                link_loc = last_t.locator(
+                                    "a[href*='.md'], a[download], a:has-text('.md')"
                                 ).first
                                 if await link_loc.count() > 0 and await link_loc.is_visible():
-                                    logger.info("Found inline .md text link — clicking...")
-                                    async with page.expect_download(timeout=12000) as dl_info:
+                                    logger.info("Clicking inline text download link...")
+                                    async with page.expect_download(timeout=15000) as dl_info:
                                         await link_loc.click(timeout=3000)
                                     dl_val = await dl_info.value
-                                    if dl_val.suggested_filename.lower().endswith((".md", ".txt", ".markdown")):
-                                        logger.info("Inline link download captured: %s", dl_val.suggested_filename)
+                                    if dl_val.suggested_filename.lower().endswith(
+                                        (".md", ".txt", ".markdown")
+                                    ):
                                         file_download_obj = dl_val
-                            except Exception as dl_err:
-                                logger.debug("Inline text link download failed: %s", dl_err)
+                                        logger.info("Text-link download captured: %s",
+                                                    file_download_obj.suggested_filename)
+                        except Exception as e:
+                            logger.debug("Text-link fallback: %s", e)
 
-                        # ── Strategy 3: DOM text scrape ──
-                        # Even if no file download was captured, scrape the markdown text
-                        # from the page and save it ourselves — job never fails due to download.
-                        md_content = ""
-                        try:
-                            md_content = await page.evaluate("""() => {
+                    # ══ PHASE 6: DOM text scrape — guaranteed non-empty result ══
+                    # Even without a file download, we grab the full text of the last
+                    # assistant turn and save it as .md. The job NEVER fails here.
+                    try:
+                        md_content = await page.evaluate("""
+                            () => {
                                 const turns = document.querySelectorAll("[data-message-author-role='assistant']");
-                                if (!turns || turns.length === 0) return '';
+                                if (!turns.length) return '';
                                 const turn = turns[turns.length - 1];
-
-                                // Priority 1: code block content (```yaml / ```markdown / ```md)
-                                const codeBlocks = turn.querySelectorAll('pre code');
-                                for (const code of codeBlocks) {
+                                // Priority 1: pre code blocks (yaml / md fenced block)
+                                for (const code of turn.querySelectorAll('pre code')) {
                                     const t = code.innerText.trim();
                                     if (t.length > 50) return t;
                                 }
+                                // Priority 2: prose / markdown container
+                                const prose = turn.querySelector('.markdown, [class*="prose"]') || turn;
+                                return (prose.innerText || '').trim();
+                            }
+                        """) or ""
+                    except Exception as e:
+                        logger.debug("DOM text scrape: %s", e)
 
-                                // Priority 2: prose/markdown container
-                                const mdContainer = turn.querySelector('.markdown') ||
-                                                   turn.querySelector('[class*="prose"]') ||
-                                                   turn;
-                                const text = (mdContainer.innerText || '').trim();
-                                return text.length > 50 ? text : '';
-                            }""") or ""
-                        except Exception as md_err:
-                            logger.debug("Markdown text scrape failed: %s", md_err)
-
-                        if file_download_obj or (md_content and len(md_content.strip()) >= 20):
-                            gen_duration = time.perf_counter() - t_gen_start
-                            logger.info(
-                                "Generation finished in %.2fs. Markdown captured (download=%s, text_chars=%d).",
-                                gen_duration, bool(file_download_obj), len(md_content)
-                            )
-                            results = [{
-                                "type": "markdown",
-                                "content": md_content.strip(),
-                                "download": file_download_obj,
-                            }]
-                            await cls.dismiss_overlays(page)
-                            return True, results, None, gen_duration
+                    if file_download_obj or (md_content and len(md_content.strip()) >= 20):
+                        gen_duration = time.perf_counter() - t_gen_start
+                        logger.info(
+                            "MD done in %.2fs — file_dl=%s  text_chars=%d",
+                            gen_duration, bool(file_download_obj), len(md_content)
+                        )
+                        results = [{
+                            "type": "markdown",
+                            "content": md_content.strip(),
+                            "download": file_download_obj,
+                        }]
+                        await cls.dismiss_overlays(page)
+                        return True, results, None, gen_duration
 
                 # -------------------------------------------------------------
                 # Branch B: Image Prompt Mode (Default: Job expects photo)
