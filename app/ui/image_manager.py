@@ -170,7 +170,10 @@ class ImageManagerPanel(QWidget):
 
     def _open_file_dialog(self) -> None:
         filter_str = "Images (*.png *.jpg *.jpeg *.webp)"
-        files, _ = QFileDialog.getOpenFileNames(self, "Select Images for Studio", "", filter_str)
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select Images for Studio", "", filter_str,
+            options=QFileDialog.Option.DontUseNativeDialog
+        )
         if files:
             paths = [Path(f) for f in files]
             self.import_image_files(paths)

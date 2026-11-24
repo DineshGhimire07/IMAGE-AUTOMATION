@@ -82,20 +82,28 @@ class ImageProcessor:
 
         try:
             # 1. Image upload handling (stay strictly inside the single open chat session)
-            if is_new_product:
-                logger.info("Uploading source image for Product %02d (Job #%d) in current chat session...", image_index, job.id)
-                t_upload_start = time.perf_counter()
-                upload_duration = await chatgpt_controller.upload_image(page, Path(job.image_path))
-            else:
-                # Continuing same product in the same chat: photo is already in chat!
-                logger.info(
-                    "Continuing Product %02d in current chat for Job #%d: Photo is already in chat, skipping re-upload.",
-                    image_index, job.id
-                )
-                upload_duration = 0.0
+            # Always attach the product's original source image for each prompt so ChatGPT
+            # exclusively analyzes and references the original photo, NEVER using a previously
+            # generated thumbnail/mockup!
+            img_file = Path(job.image_path)
+            logger.info(
+                "Uploading original source image for Product %02d (Job #%d, Prompt %d): %s",
+                image_index, job.id, prompt_order, img_file.name
+            )
+            t_upload_start = time.perf_counter()
+            upload_duration = await chatgpt_controller.upload_image(page, img_file)
 
             # 2. Enter and submit prompt
-            await chatgpt_controller.enter_and_submit_prompt(page, job.prompt_text)
+            # For subsequent prompts, reinforce that ChatGPT must use the attached original product image
+            prompt_payload = job.prompt_text
+            if prompt_order > 1:
+                prompt_payload = (
+                    "[IMPORTANT INSTRUCTION: Use the attached original reference poster image as the sole source. "
+                    "Do NOT use, reference, or incorporate any previously generated room mockups, wall frames, or thumbnails from this chat.]\n\n"
+                    + prompt_payload
+                )
+
+            await chatgpt_controller.enter_and_submit_prompt(page, prompt_payload)
 
             # 3. Transition to GENERATING
             db.update_job_status(job.id, JobStatus.GENERATING)

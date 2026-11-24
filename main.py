@@ -35,6 +35,10 @@ def main() -> int:
     if recovered > 0:
         logger.info("Restored %d interrupted jobs to PENDING state.", recovered)
 
+    # Prevent macOS Cocoa CFRetain NULL crash on Sequoia/Sonoma when opening file dialogs
+    if sys.platform == "darwin":
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, True)
+
     # Initialize PySide6 Application
     app = QApplication(sys.argv)
     app.setApplicationName(config.app_name)

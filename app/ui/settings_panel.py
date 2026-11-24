@@ -132,12 +132,18 @@ class SettingsPanel(QWidget):
         layout.addStretch()
 
     def _browse_output_dir(self) -> None:
-        dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.edit_output_dir.text())
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "Select Output Directory", self.edit_output_dir.text(),
+            options=QFileDialog.Option.DontUseNativeDialog
+        )
         if dir_path:
             self.edit_output_dir.setText(dir_path)
 
     def _browse_chrome_path(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Chrome Executable", "")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Chrome Executable", "",
+            options=QFileDialog.Option.DontUseNativeDialog
+        )
         if file_path:
             self.edit_chrome_path.setText(file_path)
 

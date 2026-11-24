@@ -18,13 +18,110 @@ class ChatGPTControllerError(Exception):
 class ChatGPTController:
     """Interacts with ChatGPT UI via accessible, observable locators."""
 
-    @staticmethod
-    async def find_prompt_input(page: Page) -> Optional[Locator]:
-        """Locates the active message input area."""
-        for sel in selectors.prompt_input:
-            loc = page.locator(sel)
-            if await loc.count() > 0 and await loc.first.is_visible():
-                return loc.first
+    @classmethod
+    async def dismiss_overlays(cls, page: Page) -> None:
+        """Dismisses any active modals, lightboxes, backdrops, or floating banners."""
+        try:
+            # 1. Close any visible modal/dialog close or dismiss buttons
+            close_selectors = [
+                "button[aria-label*='Close']",
+                "button[aria-label*='close']",
+                "button[data-testid*='close']",
+                "[role='dialog'] button[aria-label*='Close']",
+                "[role='dialog'] button:has-text('Close')",
+                "button:has-text('Close')",
+                "button:has-text('Dismiss')",
+                "button:has-text('Not now')",
+                "button:has-text('Stay logged out')",
+                "button:has-text('Cancel')",
+            ]
+            for sel in close_selectors:
+                try:
+                    loc = page.locator(sel)
+                    cnt = await loc.count()
+                    for i in range(cnt):
+                        btn = loc.nth(i)
+                        if await btn.is_visible():
+                            await btn.click(timeout=800)
+                            await asyncio.sleep(0.1)
+                except Exception:
+                    pass
+
+            # 2. Press Escape key twice to dismiss image lightboxes / popups
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.1)
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+            # 3. Click scroll to bottom if ChatGPT shows floating scroll-to-bottom arrow
+            scroll_btn = page.locator("button[aria-label*='Scroll to bottom'], button:has-text('Scroll to bottom'), button[class*='scroll-bottom']")
+            if await scroll_btn.count() > 0 and await scroll_btn.first.is_visible():
+                try:
+                    await scroll_btn.first.click(timeout=800)
+                except Exception:
+                    pass
+
+            # 4. Remove any stuck inert or aria-hidden on main content / prompt textarea
+            await page.evaluate("""() => {
+                const el = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"], textarea');
+                if (el) {
+                    let parent = el.parentElement;
+                    while (parent && parent !== document.body) {
+                        if (parent.getAttribute('aria-hidden') === 'true') {
+                            parent.removeAttribute('aria-hidden');
+                        }
+                        if (parent.hasAttribute('inert')) {
+                            parent.removeAttribute('inert');
+                        }
+                        parent = parent.parentElement;
+                    }
+                }
+            }""")
+        except Exception as e:
+            logger.debug("Overlay dismissal pass exception ignored: %s", e)
+
+    @classmethod
+    async def find_prompt_input(cls, page: Page, timeout_seconds: float = 15.0) -> Optional[Locator]:
+        """
+        Locates the active message input area with resilient polling,
+        modal auto-dismissal, and DOM presence fallbacks.
+        """
+        poll_start = time.perf_counter()
+        while (time.perf_counter() - poll_start) < timeout_seconds:
+            # Dismiss any blocking overlays
+            await cls.dismiss_overlays(page)
+
+            # Check accessible & visible selectors
+            for sel in selectors.prompt_input:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    first = loc.first
+                    if await first.is_visible():
+                        return first
+
+            # Fallback check: Element exists in DOM
+            try:
+                found_in_dom = await page.evaluate("""() => {
+                    const el = document.querySelector('#prompt-textarea, [contenteditable="true"][role="textbox"], textarea[placeholder*="Ask"], textarea[placeholder*="Message"]');
+                    if (el) {
+                        el.scrollIntoView({ block: 'nearest' });
+                        return true;
+                    }
+                    return false;
+                }""")
+                if found_in_dom:
+                    for sel in selectors.prompt_input:
+                        loc = page.locator(sel)
+                        if await loc.count() > 0:
+                            return loc.first
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.5)
+
+        logger.warning("Prompt input could not be found within %.1fs timeout.", timeout_seconds)
         return None
 
     @staticmethod
@@ -91,42 +188,57 @@ class ChatGPTController:
             logger.error("Failed to upload image %s: %s", image_path.name, e)
             raise ChatGPTControllerError(f"Image upload failed: {e}") from e
 
-    @staticmethod
-    async def enter_and_submit_prompt(page: Page, prompt_text: str) -> None:
+    @classmethod
+    async def enter_and_submit_prompt(cls, page: Page, prompt_text: str) -> None:
         """Enters prompt text into the composer and clicks Send with overlay auto-dismissal."""
         logger.info("Entering prompt: '%s...'", prompt_text[:60])
 
-        # Dismiss any modal dialog or overlay if present
-        try:
-            close_btn = page.locator("button[aria-label*='Close'], button[data-testid*='close'], button:has-text('Close')")
-            if await close_btn.count() > 0 and await close_btn.first.is_visible():
-                await close_btn.first.click(timeout=1500)
-            await page.keyboard.press("Escape")
-        except Exception:
-            pass
+        input_loc = await cls.find_prompt_input(page, timeout_seconds=15.0)
+        if not input_loc:
+            # One final scroll down attempt
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await cls.dismiss_overlays(page)
+                for sel in selectors.prompt_input:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0:
+                        input_loc = loc.first
+                        break
+            except Exception:
+                pass
 
-        input_loc = await ChatGPTController.find_prompt_input(page)
         if not input_loc:
             raise ChatGPTControllerError("ChatGPT prompt textarea could not be found.")
 
-        # Focus and fill with fallback
+        # Focus input
         try:
-            await input_loc.click(timeout=4000)
+            await input_loc.click(timeout=3000)
         except Exception:
-            # Force focus directly if overlay or animation intercepts pointer
             logger.debug("Click on prompt input timed out, using direct focus.")
             await input_loc.focus()
 
-        await input_loc.fill(prompt_text)
+        # Fill prompt text with fallback
+        try:
+            await input_loc.fill(prompt_text)
+        except Exception as fill_err:
+            logger.debug("Locator fill failed (%s), falling back to keyboard insert_text", fill_err)
+            await input_loc.focus()
+            await page.keyboard.insert_text(prompt_text)
+
         await asyncio.sleep(0.3)
 
-        # Locate send button
+        # Locate send button with brief polling for enablement
         send_btn = None
-        for sel in selectors.send_buttons:
-            loc = page.locator(sel)
-            if await loc.count() > 0 and await loc.first.is_enabled():
-                send_btn = loc.first
+        send_poll_start = time.perf_counter()
+        while (time.perf_counter() - send_poll_start) < 4.0:
+            for sel in selectors.send_buttons:
+                loc = page.locator(sel)
+                if await loc.count() > 0 and await loc.first.is_enabled():
+                    send_btn = loc.first
+                    break
+            if send_btn:
                 break
+            await asyncio.sleep(0.2)
 
         if send_btn:
             await send_btn.click()
@@ -263,6 +375,7 @@ class ChatGPTController:
                                 "content": md_content.strip(),
                                 "download": file_download_obj,
                             }]
+                            await cls.dismiss_overlays(page)
                             return True, results, None, gen_duration
 
                 # -------------------------------------------------------------
@@ -305,26 +418,23 @@ class ChatGPTController:
 
                         image_results: list[dict[str, Any]] = []
                         for idx, (img_loc, src) in enumerate(img_candidates):
-                            # Hover over image to reveal download button overlay
-                            try:
-                                await img_loc.hover(timeout=1000)
-                            except Exception:
-                                pass
-
                             download_obj: Optional[Download] = None
-                            for dl_sel in selectors.download_buttons:
-                                dl_loc = page.locator(dl_sel)
-                                if await dl_loc.count() > 0 and await dl_loc.first.is_visible():
-                                    try:
-                                        logger.info("Found native download button (%s). Triggering expect_download()...", dl_sel)
-                                        async with page.expect_download(timeout=6000) as dl_info:
-                                            await dl_loc.first.click()
-                                        download_obj = await dl_info.value
-                                        logger.info("Playwright download event captured: %s", download_obj.suggested_filename)
-                                        break
-                                    except Exception as dl_err:
-                                        logger.warning("Download event trigger failed or timed out: %s. Using image URL fallback.", dl_err)
-                                        break
+                            # Strictly check for download button inside the latest turn if present
+                            if await assistant_turns.count() > 0:
+                                last_turn = assistant_turns.last
+                                for dl_sel in selectors.download_buttons:
+                                    dl_loc = last_turn.locator(dl_sel)
+                                    if await dl_loc.count() > 0 and await dl_loc.first.is_visible():
+                                        try:
+                                            logger.info("Found native download button (%s) in turn. Triggering expect_download()...", dl_sel)
+                                            async with page.expect_download(timeout=3000) as dl_info:
+                                                await dl_loc.first.click()
+                                            download_obj = await dl_info.value
+                                            logger.info("Playwright download event captured: %s", download_obj.suggested_filename)
+                                            break
+                                        except Exception as dl_err:
+                                            logger.debug("Turn download trigger failed (%s), using URL download fallback.", dl_err)
+                                            break
 
                             image_results.append({
                                 "type": "image",
@@ -332,6 +442,8 @@ class ChatGPTController:
                                 "download": download_obj,
                             })
 
+                        # Clean any lingering overlays or lightboxes
+                        await cls.dismiss_overlays(page)
                         return True, image_results, None, gen_duration
 
             await asyncio.sleep(poll_interval)
