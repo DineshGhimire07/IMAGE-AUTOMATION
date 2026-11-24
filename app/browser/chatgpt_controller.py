@@ -213,62 +213,57 @@ class ChatGPTController:
                 # Branch A: Markdown Prompt Mode (Job is intended for .md file)
                 # -------------------------------------------------------------
                 if is_markdown:
-                    # Check for native file download button for a .md or text file
-                    file_download_obj: Optional[Download] = None
-                    file_dl_loc = page.locator("a[download*='.md'], a:has-text('.md'), button:has-text('Download'), [data-testid*='download']")
-                    if await file_dl_loc.count() > 0 and await file_dl_loc.first.is_visible():
+                    assistant_turns = page.locator("[data-message-author-role='assistant']")
+                    if await assistant_turns.count() > 0:
+                        last_turn_loc = assistant_turns.last
+
+                        # Check for native file download link strictly inside this latest assistant turn
+                        file_download_obj: Optional[Download] = None
+                        file_dl_loc = last_turn_loc.locator("a[download], a[href*='download'], a:has-text('.md')")
+                        if await file_dl_loc.count() > 0 and await file_dl_loc.first.is_visible():
+                            try:
+                                logger.info("Found .md file download link in latest turn. Triggering expect_download()...")
+                                async with page.expect_download(timeout=4000) as dl_info:
+                                    await file_dl_loc.first.click()
+                                dl_val = await dl_info.value
+                                if dl_val.suggested_filename.lower().endswith((".md", ".txt", ".markdown")):
+                                    file_download_obj = dl_val
+                            except Exception as dl_err:
+                                logger.debug("File download expect failed: %s", dl_err)
+
+                        # Extract clean markdown text directly from the latest assistant turn
+                        md_content = ""
                         try:
-                            logger.info("Found .md file download button. Triggering expect_download()...")
-                            async with page.expect_download(timeout=5000) as dl_info:
-                                await file_dl_loc.first.click()
-                            dl_val = await dl_info.value
-                            if dl_val.suggested_filename.lower().endswith((".md", ".txt", ".markdown")):
-                                file_download_obj = dl_val
-                        except Exception as e:
-                            logger.debug("File download expect failed: %s", e)
+                            md_content = await page.evaluate("""() => {
+                                const turns = document.querySelectorAll("[data-message-author-role='assistant']");
+                                if (!turns || turns.length === 0) return '';
+                                const turn = turns[turns.length - 1];
 
-                    # Extract the full markdown text / YAML frontmatter from the assistant turn
-                    md_content = ""
-                    try:
-                        md_data = await page.evaluate("""() => {
-                            const turns = document.querySelectorAll("[data-message-author-role='assistant']");
-                            if (!turns || turns.length === 0) return { fullText: '', codeContent: '' };
-                            const turn = turns[turns.length - 1];
-
-                            const codeBlocks = turn.querySelectorAll('pre code');
-                            let codeContent = '';
-                            if (codeBlocks.length > 0) {
-                                const blocks = [];
-                                for (const cb of codeBlocks) {
-                                    blocks.push(cb.innerText);
+                                // 1. Check if formatted in code block (e.g. ```markdown ... ```)
+                                const code = turn.querySelector('pre code');
+                                if (code && code.innerText.trim().length > 20) {
+                                    return code.innerText.trim();
                                 }
-                                codeContent = blocks.join('\\n\\n');
-                            }
 
-                            const clone = turn.cloneNode(true);
-                            const removeEls = clone.querySelectorAll("button, [role='button'], svg, img, [class*='button']");
-                            removeEls.forEach(el => el.remove());
-                            const fullText = (clone.innerText || '').trim();
+                                // 2. Extract from markdown container
+                                const mdContainer = turn.querySelector('.markdown') || turn.querySelector('[class*="prose"]') || turn;
+                                return (mdContainer.innerText || '').trim();
+                            }""") or ""
+                        except Exception as md_err:
+                            logger.debug("Markdown extraction evaluation failed: %s", md_err)
 
-                            return { fullText: fullText, codeContent: codeContent };
-                        }""")
-                        if md_data:
-                            md_content = md_data.get("codeContent") or md_data.get("fullText") or ""
-                    except Exception as md_err:
-                        logger.debug("Markdown extraction evaluation failed: %s", md_err)
-
-                    if file_download_obj or (md_content and len(md_content.strip()) >= 5):
-                        gen_duration = time.perf_counter() - t_gen_start
-                        logger.info(
-                            "Generation finished in %.2fs. Captured Markdown output (%d chars).",
-                            gen_duration, len(md_content)
-                        )
-                        results = [{
-                            "type": "markdown",
-                            "content": md_content.strip(),
-                            "download": file_download_obj,
-                        }]
-                        return True, results, None, gen_duration
+                        if file_download_obj or (md_content and len(md_content.strip()) >= 10):
+                            gen_duration = time.perf_counter() - t_gen_start
+                            logger.info(
+                                "Generation finished in %.2fs. Successfully captured Markdown output (%d chars).",
+                                gen_duration, len(md_content)
+                            )
+                            results = [{
+                                "type": "markdown",
+                                "content": md_content.strip(),
+                                "download": file_download_obj,
+                            }]
+                            return True, results, None, gen_duration
 
                 # -------------------------------------------------------------
                 # Branch B: Image Prompt Mode (Default: Job expects photo)
