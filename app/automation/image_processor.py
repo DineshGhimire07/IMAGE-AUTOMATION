@@ -81,22 +81,15 @@ class ImageProcessor:
         is_md = self._is_markdown_job(job, prompt_order, prompt_name)
 
         try:
-            # 1. Image upload handling
+            # 1. Image upload handling (stay strictly inside the single open chat session)
             if is_new_product:
-                # Start fresh chat session for new product
-                try:
-                    logger.info("Starting fresh chat session for new Product %02d (Job #%d)...", image_index, job.id)
-                    await page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=15000)
-                    await asyncio.sleep(1.0)
-                except Exception as nav_err:
-                    logger.debug("Page navigation to fresh chat: %s", nav_err)
-
+                logger.info("Uploading source image for Product %02d (Job #%d) in current chat session...", image_index, job.id)
                 t_upload_start = time.perf_counter()
                 upload_duration = await chatgpt_controller.upload_image(page, Path(job.image_path))
             else:
                 # Continuing same product in the same chat: photo is already in chat!
                 logger.info(
-                    "Continuing Product %02d chat for Job #%d: Photo is already in chat, skipping re-upload.",
+                    "Continuing Product %02d in current chat for Job #%d: Photo is already in chat, skipping re-upload.",
                     image_index, job.id
                 )
                 upload_duration = 0.0
