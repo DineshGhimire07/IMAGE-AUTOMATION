@@ -654,7 +654,16 @@ class ChatGPTController:
 
                     # == ALWAYS RETURN — never loop after generation is confirmed complete ==
                     gen_duration = time.perf_counter() - t_gen_start
-                    if file_download_obj or (md_content and len(md_content.strip()) >= 10):
+                    # Validate md_content: reject prompt text / ChatGPT questions.
+                    # A real generated listing will contain product_id/XINVORA/YAML markers.
+                    md_valid = False
+                    if md_content:
+                        _mds = md_content.strip()
+                        md_valid = len(_mds) >= 50 and any(k in _mds for k in [
+                            "product_id:", "XINVORA", "seller_sku:",
+                            "special_price:", "highlights:", "---",
+                        ])
+                    if file_download_obj or md_valid:
                         logger.info(
                             "MD done in %.2fs — file_downloaded=%s  text_chars=%d",
                             gen_duration, bool(file_download_obj), len(md_content)

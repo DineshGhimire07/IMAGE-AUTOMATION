@@ -88,6 +88,17 @@ class ImageProcessor:
             signals.job_status_changed.emit(job.id, JobStatus.FAILED.value, err)
             return False
 
+        # ─────────────────────────────────────────────────────────────
+        # NEW PRODUCT → open a fresh ChatGPT chat to clear all context.
+        # Each product gets its own clean conversation so ChatGPT never
+        # confuses Product 2's prompts with Product 1's prior messages.
+        # ─────────────────────────────────────────────────────────────
+        if is_new_product:
+            logger.info("New product detected — navigating to fresh ChatGPT chat...")
+            await browser_manager.navigate_to_chatgpt(force_fresh=True)
+            await asyncio.sleep(3.0)   # let the new chat load fully
+            logger.info("Fresh chat ready for Product processing.")
+
         batch_folder = file_manager.get_or_create_batch_folder()
 
         all_imgs = db.get_all_images()
