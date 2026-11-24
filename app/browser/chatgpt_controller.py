@@ -442,179 +442,164 @@ class ChatGPTController:
                     file_download_obj: Optional[Download] = None
                     md_content = ""
 
-                    # ══ PHASE 1: Scroll the ChatGPT conversation to the bottom ══
-                    # ChatGPT uses its own overflow scroll container, not window.
-                    # We try every possible scroll container + End key + scrollIntoView.
-                    logger.info("Scrolling ChatGPT to bottom to reveal .md document card...")
-                    for _scroll_attempt in range(3):
-                        try:
-                            await page.evaluate("""
-                                () => {
-                                    // 1. Scroll every overflow container to its bottom
-                                    document.querySelectorAll(
-                                        'main, [role="main"], div[class*="overflow-y"], ' +
-                                        'div[class*="scroll"], div[class*="Scroll"]'
-                                    ).forEach(el => {
-                                        try { el.scrollTop = el.scrollHeight; } catch(e) {}
-                                    });
-                                    // 2. Scroll window too
-                                    window.scrollTo(0, document.body.scrollHeight);
-                                }
-                            """)
-                            await page.keyboard.press("End")
-                        except Exception:
-                            pass
-                        await asyncio.sleep(1.0)
+                    # ══ STEP 1: Scroll every ChatGPT scroll container to the very bottom ══
+                    logger.info("MD: Scrolling to bottom to reveal the .md document card...")
+                    try:
+                        await page.evaluate("""
+                            () => {
+                                document.querySelectorAll(
+                                    'main, [role="main"], div[class*="overflow-y"], ' +
+                                    'div[class*="overflow-x"], div[class*="scroll"]'
+                                ).forEach(el => {
+                                    try { el.scrollTop = el.scrollHeight; } catch(_) {}
+                                });
+                                window.scrollTo(0, document.body.scrollHeight);
+                            }
+                        """)
+                        await page.keyboard.press("End")
+                    except Exception:
+                        pass
+                    # Give the page 2 s to finish rendering after scroll
+                    await asyncio.sleep(2.0)
 
-                    # Extra 3s gap after scroll so the card fully renders
-                    logger.info("Waiting 3s after scroll for .md card to fully render...")
-                    await asyncio.sleep(3.0)
-
-                    # ══ PHASE 2: Use JS to find the card, scroll it into view, return coords ══
-                    card_info = await page.evaluate("""
+                    # ══ STEP 2: Find the .md document card using JS and CLICK it ══
+                    # The card looks like:  [🗒 XINVORA_...Poster.md  Document]
+                    # Clicking it opens the right-side preview panel.
+                    logger.info("MD: Searching for the .md document card to click...")
+                    card_coords = await page.evaluate("""
                         () => {
-                            const turns = document.querySelectorAll("[data-message-author-role='assistant']");
+                            const turns = document.querySelectorAll(
+                                "[data-message-author-role='assistant']"
+                            );
                             if (!turns.length) return null;
                             const lastTurn = turns[turns.length - 1];
 
-                            // Gather every element in the last turn
                             const candidates = Array.from(lastTurn.querySelectorAll('*'));
                             for (const el of candidates) {
                                 const text = el.innerText || el.textContent || '';
-                                // Card has 'Open file' label OR a filename ending in .md
-                                const looksLikeCard = (
-                                    text.includes('Open file') ||
-                                    text.includes('Document') ||
-                                    /\\.md$/.test(text.trim()) ||
-                                    /\\.md\\b/.test(text)
-                                );
-                                if (!looksLikeCard) continue;
+                                // Must mention .md AND either 'Document' or 'Open file'
+                                const isMdCard = text.includes('.md') &&
+                                    (text.includes('Document') || text.includes('Open file'));
+                                if (!isMdCard) continue;
 
                                 const rect = el.getBoundingClientRect();
-                                // Card-sized: at least 100px wide, between 30 and 150px tall
-                                if (rect.width < 100 || rect.height < 20 || rect.height > 200) continue;
-                                // Must be visible on screen (or just below)
-                                if (rect.bottom < -50) continue;
+                                // Card is small: 100–700 px wide, 20–150 px tall
+                                if (rect.width  < 100 || rect.width  > 750) continue;
+                                if (rect.height <  20 || rect.height > 160) continue;
 
                                 // Scroll the card to the vertical center of the viewport
                                 el.scrollIntoView({ behavior: 'instant', block: 'center' });
                                 const r2 = el.getBoundingClientRect();
-                                return {
-                                    centerX: r2.left + r2.width / 2,
-                                    centerY: r2.top  + r2.height / 2,
-                                    // Right edge minus 30px = where the ↓ button lives
-                                    btnX: r2.right - 30,
-                                    btnY: r2.top  + r2.height / 2,
-                                };
+                                return { x: r2.left + r2.width / 2,
+                                         y: r2.top  + r2.height / 2 };
                             }
                             return null;
                         }
                     """)
 
-                    if card_info:
-                        cx = card_info["centerX"]
-                        cy = card_info["centerY"]
-                        bx = card_info["btnX"]
-                        by = card_info["btnY"]
-                        logger.info(
-                            "Found .md card at (%.0f, %.0f); download btn ~(%.0f, %.0f)",
-                            cx, cy, bx, by
-                        )
+                    if card_coords:
+                        cx = card_coords["x"]
+                        cy = card_coords["y"]
+                        logger.info("MD: Clicking .md card at (%.0f, %.0f)...", cx, cy)
+                        await page.mouse.click(cx, cy)
+                        # Wait for the right-side preview panel to open
+                        await asyncio.sleep(2.5)
 
-                        # ══ PHASE 3: Real mouse-hover to trigger the CSS :hover state ══
-                        # Playwright's .hover() calls page.mouse.move() internally — but
-                        # we do it explicitly so we can control the exact coordinates.
-                        await page.mouse.move(cx, cy)   # enter the card
-                        await asyncio.sleep(1.0)         # wait for :hover CSS to fire
-                        await page.mouse.move(bx, by)   # slide to where ↓ button appears
-                        await asyncio.sleep(0.8)
-
-                        # ══ PHASE 4: Try every download mechanism ══
-                        # 4a — aria-label button (should now be visible after hover)
-                        for dl_aria in [
+                        # ══ STEP 3: Find the download button in the preview panel header ══
+                        # After clicking the card, ChatGPT opens a right-side panel.
+                        # The download (↓) button is in the top-right header of that panel.
+                        # We search the whole page (not scoped) because the button is in
+                        # a separate DOM layer.
+                        logger.info("MD: Preview panel open — searching for download button...")
+                        dl_selectors = [
+                            "button[aria-label='Download']",
                             "button[aria-label*='Download']",
                             "button[aria-label*='download']",
+                            "button[title='Download']",
                             "button[title*='Download']",
                             "button[title*='download']",
+                            "[data-testid='download-file-button']",
                             "[data-testid*='download']",
-                        ]:
+                            "a[download]",
+                        ]
+                        for dl_sel in dl_selectors:
                             if file_download_obj:
                                 break
                             try:
-                                dl_loc = page.locator(dl_aria).first
+                                dl_loc = page.locator(dl_sel).first
                                 if await dl_loc.count() > 0 and await dl_loc.is_visible():
-                                    logger.info("Clicking aria download button (%s)...", dl_aria)
+                                    logger.info("MD: Clicking download button in preview (%s)...", dl_sel)
                                     async with page.expect_download(timeout=15000) as dl_info:
                                         await dl_loc.click(timeout=3000)
                                     file_download_obj = await dl_info.value
-                                    logger.info("Download captured: %s", file_download_obj.suggested_filename)
+                                    logger.info("MD: Captured download: %s",
+                                                file_download_obj.suggested_filename)
                             except Exception as e:
-                                logger.debug("aria download btn %s: %s", dl_aria, e)
+                                logger.debug("MD: preview dl btn %s → %s", dl_sel, e)
 
-                        # 4b — click at the exact coordinates where the ↓ button lives
-                        if not file_download_obj:
-                            try:
-                                logger.info("Clicking at card right-edge coordinates (%.0f, %.0f)...", bx, by)
-                                async with page.expect_download(timeout=15000) as dl_info:
-                                    await page.mouse.click(bx, by)
-                                file_download_obj = await dl_info.value
-                                logger.info("Download captured via coordinate click: %s",
-                                            file_download_obj.suggested_filename)
-                            except Exception as e:
-                                logger.debug("Coordinate click download: %s", e)
-                    else:
-                        logger.warning("Could not locate .md document card in page DOM.")
-
-                    # ══ PHASE 5: Text-link fallback ══
-                    # ChatGPT prints "Markdown File: Download …md ↗" as a plain <a> link
-                    if not file_download_obj:
+                        # ══ STEP 4: Close the preview panel ══
+                        logger.info("MD: Closing preview panel (Escape)...")
                         try:
-                            assistant_turns_loc = page.locator("[data-message-author-role='assistant']")
-                            if await assistant_turns_loc.count() > 0:
-                                last_t = assistant_turns_loc.last
-                                link_loc = last_t.locator(
+                            await page.keyboard.press("Escape")
+                            await asyncio.sleep(0.5)
+                        except Exception:
+                            pass
+                    else:
+                        logger.warning("MD: Could not find .md card in DOM — skipping card click.")
+
+                    # ══ STEP 5: Fallback — click the inline text link above the card ══
+                    # ChatGPT often also renders:
+                    #   "Markdown File: Download XINVORA_...Poster.md ↗"
+                    # as a plain <a> link in the assistant message text.
+                    if not file_download_obj:
+                        logger.info("MD: Trying inline text link fallback...")
+                        try:
+                            turns_loc = page.locator("[data-message-author-role='assistant']")
+                            if await turns_loc.count() > 0:
+                                last_t = turns_loc.last
+                                link = last_t.locator(
                                     "a[href*='.md'], a[download], a:has-text('.md')"
                                 ).first
-                                if await link_loc.count() > 0 and await link_loc.is_visible():
-                                    logger.info("Clicking inline text download link...")
+                                if await link.count() > 0 and await link.is_visible():
                                     async with page.expect_download(timeout=15000) as dl_info:
-                                        await link_loc.click(timeout=3000)
+                                        await link.click(timeout=3000)
                                     dl_val = await dl_info.value
                                     if dl_val.suggested_filename.lower().endswith(
                                         (".md", ".txt", ".markdown")
                                     ):
                                         file_download_obj = dl_val
-                                        logger.info("Text-link download captured: %s",
+                                        logger.info("MD: Text-link download: %s",
                                                     file_download_obj.suggested_filename)
                         except Exception as e:
-                            logger.debug("Text-link fallback: %s", e)
+                            logger.debug("MD: text-link fallback → %s", e)
 
-                    # ══ PHASE 6: DOM text scrape — guaranteed non-empty result ══
-                    # Even without a file download, we grab the full text of the last
-                    # assistant turn and save it as .md. The job NEVER fails here.
+                    # ══ STEP 6: Guaranteed fallback — scrape text from DOM ══
+                    # Even without a file download we capture the visible text and
+                    # save it as a .md file so the job NEVER fails.
                     try:
                         md_content = await page.evaluate("""
                             () => {
-                                const turns = document.querySelectorAll("[data-message-author-role='assistant']");
+                                const turns = document.querySelectorAll(
+                                    "[data-message-author-role='assistant']"
+                                );
                                 if (!turns.length) return '';
                                 const turn = turns[turns.length - 1];
-                                // Priority 1: pre code blocks (yaml / md fenced block)
                                 for (const code of turn.querySelectorAll('pre code')) {
                                     const t = code.innerText.trim();
                                     if (t.length > 50) return t;
                                 }
-                                // Priority 2: prose / markdown container
-                                const prose = turn.querySelector('.markdown, [class*="prose"]') || turn;
+                                const prose =
+                                    turn.querySelector('.markdown, [class*="prose"]') || turn;
                                 return (prose.innerText || '').trim();
                             }
                         """) or ""
                     except Exception as e:
-                        logger.debug("DOM text scrape: %s", e)
+                        logger.debug("MD: DOM scrape → %s", e)
 
                     if file_download_obj or (md_content and len(md_content.strip()) >= 20):
                         gen_duration = time.perf_counter() - t_gen_start
                         logger.info(
-                            "MD done in %.2fs — file_dl=%s  text_chars=%d",
+                            "MD done in %.2fs — file_downloaded=%s  text_chars=%d",
                             gen_duration, bool(file_download_obj), len(md_content)
                         )
                         results = [{
