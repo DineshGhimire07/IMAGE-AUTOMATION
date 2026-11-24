@@ -343,9 +343,5 @@ class ChatGPTController:
 
         return False, [], f"Generation timed out after {timeout_seconds} seconds.", time.perf_counter() - t_gen_start
 
-            await asyncio.sleep(poll_interval)
-
-        return False, [], f"Generation timed out after {timeout_seconds} seconds.", time.perf_counter() - t_gen_start
-
 
 chatgpt_controller = ChatGPTController()
