@@ -373,6 +373,7 @@ class ChatGPTController:
         timeout_seconds: int = 240,
         poll_interval: float = 1.0,
         is_markdown: bool = False,
+        known_image_srcs: Optional[set] = None,
     ) -> Tuple[bool, list[dict[str, Any]], Optional[str], float]:
         """
         Observes generation lifecycle:
@@ -382,6 +383,11 @@ class ChatGPTController:
            Extracts generated .md file or markdown text listing; NEVER downloads an image.
         4. If is_markdown=False:
            Scans for all newly rendered generated images in the assistant's turn (handles 1 or 2 options).
+
+        Args:
+            known_image_srcs: Set of image src URLs already seen from previous prompts.
+                              Any image whose src is in this set is SKIPPED so we never
+                              re-download the same image for a different prompt.
         """
         logger.info(
             "Waiting for generation to start and complete (timeout: %ds, mode: %s)...",
@@ -570,6 +576,7 @@ class ChatGPTController:
                 # -------------------------------------------------------------
                 else:
                     img_candidates: list[tuple[Locator, str]] = []
+                    _known = known_image_srcs or set()
 
                     # First check images inside the latest assistant message turn
                     assistant_turns = page.locator("[data-message-author-role='assistant']")
@@ -581,6 +588,12 @@ class ChatGPTController:
                             if await el.is_visible():
                                 src_val = await el.get_attribute("src")
                                 if src_val and not src_val.startswith("data:image/svg"):
+                                    if src_val in _known:
+                                        logger.debug(
+                                            "Skipping already-seen image src (Prompt %d duplicate): %.80s",
+                                            idx, src_val
+                                        )
+                                        continue
                                     img_candidates.append((el, src_val))
 
                     # Fallback to general selectors if assistant turn locator found nothing
@@ -592,7 +605,7 @@ class ChatGPTController:
                                 candidate = loc.nth(cnt - 1)
                                 if await candidate.is_visible():
                                     src_val = await candidate.get_attribute("src")
-                                    if src_val and not src_val.startswith("data:image/svg"):
+                                    if src_val and not src_val.startswith("data:image/svg") and src_val not in _known:
                                         img_candidates.append((candidate, src_val))
                                         break
 

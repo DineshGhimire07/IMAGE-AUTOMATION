@@ -21,6 +21,8 @@ class ImageProcessor:
 
     def __init__(self):
         self.last_performance_report: Dict[str, Any] = {}
+        # URLs of images captured in the last job — read by task_manager to populate seen_image_srcs
+        self.last_seen_image_srcs: set = set()
 
     @staticmethod
     def _is_markdown_job(job: JobItem, prompt_order: int, prompt_name: str) -> bool:
@@ -47,6 +49,7 @@ class ImageProcessor:
         prompt_order: int,
         prompt_name: str,
         is_new_product: bool = True,
+        known_image_srcs: Optional[set] = None,
     ) -> bool:
         """
         Executes ONE step in the pipeline for a single JobItem.
@@ -139,6 +142,7 @@ class ImageProcessor:
                     page,
                     timeout_seconds=timeout_seconds,
                     is_markdown=is_md,
+                    known_image_srcs=known_image_srcs,
                 )
             )
             extraction_duration = time.perf_counter() - t_extract_start
@@ -166,6 +170,10 @@ class ImageProcessor:
             )
 
             is_multi = len(image_results) > 1
+            # Record this job's image URLs so the next prompt knows to skip them
+            self.last_seen_image_srcs = {
+                res.get("src") for res in image_results if res.get("src")
+            }
             for i, res in enumerate(image_results):
                 res_type = res.get("type", "image")
                 dl_obj = res.get("download")

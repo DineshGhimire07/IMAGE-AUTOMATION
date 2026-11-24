@@ -91,6 +91,9 @@ class TaskManagerThread(QThread):
         db.recover_interrupted_jobs()
 
         current_product_image_id: Optional[int] = None
+        # Track image src URLs already downloaded — reset per product, passed into
+        # wait_for_generation_complete so Prompt 2 never re-grabs Prompt 1's image.
+        seen_image_srcs: set = set()
 
         try:
             while not job_queue.is_stopped:
@@ -126,6 +129,8 @@ class TaskManagerThread(QThread):
                 is_new_product = (current_product_image_id != current_job.image_id)
                 if is_new_product:
                     current_product_image_id = current_job.image_id
+                    # Reset seen image URLs when starting a fresh product
+                    seen_image_srcs = set()
 
                 # Execute sequential generation
                 success = await image_processor.process_job(
@@ -133,7 +138,12 @@ class TaskManagerThread(QThread):
                     prompt_order=prompt_order,
                     prompt_name=prompt_name,
                     is_new_product=is_new_product,
+                    known_image_srcs=seen_image_srcs,
                 )
+
+                # Accumulate image srcs from this job so the next prompt skips them
+                for src in getattr(image_processor, "last_seen_image_srcs", set()):
+                    seen_image_srcs.add(src)
 
                 # Polling pause between jobs to be gentle with browser
                 await asyncio.sleep(2.0)
