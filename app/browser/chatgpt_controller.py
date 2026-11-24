@@ -251,69 +251,30 @@ class ChatGPTController:
             raise ChatGPTControllerError("ChatGPT prompt textarea could not be found.")
 
         # --- STEP 3: Focus without clearing (image attachment must be preserved!) ---
-        # DO NOT use fill(""), Control+a+Delete, or selectAll execCommand.
-        # Those remove the image attachment node from the ProseMirror editor.
-        # Instead: focus and move cursor to END so text appends AFTER the image.
+        # IMPORTANT: Never use fill(''), Control+a+Delete, or execCommand('selectAll').
+        # Those operations remove the image attachment node from ProseMirror.
+        # We click to focus, then use keyboard.type() which fires real DOM key events
+        # that React/ProseMirror handles correctly.
         try:
             await input_loc.click(timeout=1500)
         except Exception:
             logger.debug("Click on prompt input timed out, using direct focus.")
             await input_loc.focus()
 
-        # Move cursor to absolute END of editor (after any image attachment node)
-        try:
-            await page.evaluate("""
-                () => {
-                    const el = document.querySelector('#prompt-textarea') ||
-                               document.querySelector('[contenteditable="true"][role="textbox"]') ||
-                               document.querySelector('[contenteditable="true"]');
-                    if (!el) return;
-                    el.focus();
-                    const range = document.createRange();
-                    range.selectNodeContents(el);
-                    range.collapse(false);
-                    const sel2 = window.getSelection();
-                    sel2.removeAllRanges();
-                    sel2.addRange(range);
-                }
-            """)
-        except Exception:
-            pass
+        await asyncio.sleep(0.2)
 
-        await asyncio.sleep(0.1)
-
-        # --- STEP 4: Insert text at cursor (AFTER image, image node preserved) ---
-        inserted = await page.evaluate("""
-            (text) => {
-                const el = document.querySelector('#prompt-textarea') ||
-                           document.querySelector('[contenteditable="true"][role="textbox"]') ||
-                           document.querySelector('[contenteditable="true"]');
-                if (!el) return false;
-                el.focus();
-                const range = document.createRange();
-                range.selectNodeContents(el);
-                range.collapse(false);
-                const sel2 = window.getSelection();
-                sel2.removeAllRanges();
-                sel2.addRange(range);
-                return document.execCommand('insertText', false, text);
-            }
-        """, prompt_text)
-
-        if not inserted:
-            # Fallback: keyboard typing line by line (image attachment stays intact)
-            logger.debug("execCommand did not insert text, falling back to line-by-line Shift+Enter")
-            await input_loc.focus()
-            # Move to end via keyboard (safe: does NOT remove image attachment)
-            await page.keyboard.press("End")
-            lines = prompt_text.split("\n")
-            for i, line in enumerate(lines):
-                if line:
-                    await page.keyboard.insert_text(line)
-                if i < len(lines) - 1:
-                    await page.keyboard.press("Shift+Enter")
-        else:
-            logger.debug("Prompt inserted via execCommand (image attachment preserved)")
+        # --- STEP 4: Type text using keyboard.type() - fires real key events ---
+        # keyboard.type() dispatches keydown+keypress+input+keyup per character.
+        # ProseMirror/React intercepts these and updates editor state correctly.
+        # Newlines must be Shift+Enter (plain Enter would submit the form).
+        logger.info("Typing prompt text via keyboard (preserves image attachment)...")
+        lines = prompt_text.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                await page.keyboard.type(line, delay=0)
+            if i < len(lines) - 1:
+                await page.keyboard.press("Shift+Enter")
+        logger.debug("Prompt typed via keyboard.type()")
 
         await asyncio.sleep(0.5)
 
