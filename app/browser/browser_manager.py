@@ -117,8 +117,33 @@ class BrowserManager:
         self.playwright = None
         logger.info("Browser context closed.")
 
+    async def clear_composer_draft(self) -> None:
+        """Clears any residual uncommitted drafts saved by ChatGPT in localStorage/sessionStorage."""
+        if not self.page or self.page.is_closed():
+            return
+        try:
+            await self.page.evaluate("""() => {
+                try {
+                    const el = document.querySelector('#prompt-textarea');
+                    if (el) {
+                        el.innerHTML = '<p><br></p>';
+                        el.innerText = '';
+                    }
+                    for (let i = localStorage.length - 1; i >= 0; i--) {
+                        const k = localStorage.key(i);
+                        if (k && (k.toLowerCase().includes('draft') || k.toLowerCase().includes('composer') || k.toLowerCase().includes('prompt') || k.toLowerCase().includes('editor'))) {
+                            localStorage.removeItem(k);
+                        }
+                    }
+                    sessionStorage.clear();
+                } catch (e) {}
+            }""")
+            logger.debug("Cleared residual ChatGPT composer drafts.")
+        except Exception as e:
+            logger.debug("Failed to clear composer drafts: %s", e)
+
     async def navigate_to_chatgpt(self, timeout_ms: int = 60000) -> bool:
-        """Navigates to ChatGPT home URL."""
+        """Navigates to ChatGPT home URL and clears any residual composer drafts."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser is not running.")
 
@@ -126,10 +151,13 @@ class BrowserManager:
             current_url = self.page.url
             if "chatgpt.com" in current_url:
                 logger.debug("Already on ChatGPT domain (%s)", current_url)
+                await self.clear_composer_draft()
                 return True
 
             logger.info("Navigating to %s...", config.chatgpt_url)
             await self.page.goto(config.chatgpt_url, timeout=timeout_ms, wait_until="domcontentloaded")
+            await asyncio.sleep(1.0)
+            await self.clear_composer_draft()
             return True
         except Exception as e:
             logger.error("Navigation to ChatGPT failed: %s", e)
