@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple, Any
@@ -251,30 +253,77 @@ class ChatGPTController:
             raise ChatGPTControllerError("ChatGPT prompt textarea could not be found.")
 
         # --- STEP 3: Focus without clearing (image attachment must be preserved!) ---
-        # IMPORTANT: Never use fill(''), Control+a+Delete, or execCommand('selectAll').
-        # Those operations remove the image attachment node from ProseMirror.
-        # We click to focus, then use keyboard.type() which fires real DOM key events
-        # that React/ProseMirror handles correctly.
+        # IMPORTANT: Never use fill(''), Control+a+Delete, execCommand('selectAll'),
+        # or synthetic ClipboardEvent('paste'), as they can clear the image.
         try:
             await input_loc.click(timeout=1500)
         except Exception:
             logger.debug("Click on prompt input timed out, using direct focus.")
             await input_loc.focus()
 
-        await asyncio.sleep(0.2)
+        try:
+            await page.evaluate("""() => {
+                const el = document.querySelector('#prompt-textarea') ||
+                           document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                           document.querySelector('[contenteditable="true"]');
+                if (el) el.focus();
+            }""")
+        except Exception:
+            pass
 
-        # --- STEP 4: Type text using keyboard.type() - fires real key events ---
-        # keyboard.type() dispatches keydown+keypress+input+keyup per character.
-        # ProseMirror/React intercepts these and updates editor state correctly.
-        # Newlines must be Shift+Enter (plain Enter would submit the form).
-        logger.info("Typing prompt text via keyboard (preserves image attachment)...")
-        lines = prompt_text.split("\n")
-        for i, line in enumerate(lines):
-            if line:
-                await page.keyboard.type(line, delay=0)
-            if i < len(lines) - 1:
-                await page.keyboard.press("Shift+Enter")
-        logger.debug("Prompt typed via keyboard.type()")
+        await asyncio.sleep(0.15)
+
+        # --- STEP 4: Paste prompt in ONE GO (instantaneous, preserves image) ---
+        async def _editor_has_text() -> bool:
+            try:
+                return bool(await page.evaluate("""() => {
+                    const el = document.querySelector('#prompt-textarea') ||
+                               document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                               document.querySelector('[contenteditable="true"]');
+                    if (!el) return false;
+                    const txt = (el.innerText || el.textContent || el.value || '').trim();
+                    return txt.length > 0;
+                }"""))
+            except Exception:
+                return False
+
+        pasted = False
+
+        # Strategy A: Native OS clipboard paste (pbcopy + Meta+v on macOS)
+        if sys.platform == "darwin":
+            try:
+                subprocess.run(["pbcopy"], input=prompt_text.encode("utf-8"), check=True)
+                await page.keyboard.press("Meta+v")
+                await asyncio.sleep(0.25)
+                if await _editor_has_text():
+                    pasted = True
+                    logger.info("Prompt pasted in one go via native clipboard (Meta+v).")
+            except Exception as exc:
+                logger.debug("Native pbcopy/Meta+v paste failed: %s", exc)
+
+        # Strategy B: One-shot CDP insert_text (also instantaneous)
+        if not pasted:
+            try:
+                await input_loc.focus()
+                await page.keyboard.insert_text(prompt_text)
+                await asyncio.sleep(0.25)
+                if await _editor_has_text():
+                    pasted = True
+                    logger.info("Prompt inserted in one go via keyboard.insert_text().")
+            except Exception as exc:
+                logger.debug("One-shot insert_text failed: %s", exc)
+
+        # Strategy C: Last-resort line-by-line keyboard.type()
+        if not pasted:
+            logger.warning("One-shot paste did not populate editor; falling back to keyboard.type()...")
+            await input_loc.focus()
+            lines = prompt_text.split("\n")
+            for i, line in enumerate(lines):
+                if line:
+                    await page.keyboard.type(line, delay=0)
+                if i < len(lines) - 1:
+                    await page.keyboard.press("Shift+Enter")
+            logger.debug("Prompt typed via keyboard.type() fallback.")
 
         await asyncio.sleep(0.3)
 
