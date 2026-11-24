@@ -439,100 +439,103 @@ class ChatGPTController:
                 # Branch A: Markdown Prompt Mode (Job is intended for .md file)
                 # -------------------------------------------------------------
                 if is_markdown:
+                    # Always scroll to bottom first — ChatGPT may not auto-scroll
+                    # after a long generation, so the document card is off-screen.
+                    try:
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(0.8)
+                    except Exception:
+                        pass
+
                     assistant_turns = page.locator("[data-message-author-role='assistant']")
                     if await assistant_turns.count() > 0:
                         last_turn_loc = assistant_turns.last
                         file_download_obj: Optional[Download] = None
 
-                        # ── Strategy 1: Document card → preview pane → download button ──
-                        # ChatGPT renders .md files as a clickable document card in the chat.
-                        # Clicking the card opens a preview panel on the right side.
-                        # The actual download button lives at the top-right of that preview panel.
+                        # ── Strategy 1: Hover document card → click the ↓ download button ──
+                        # ChatGPT renders .md files as a card like:
+                        #   [🗒 XINVORA_...Poster.md  Open file]  [↓]
+                        # The ↓ download button on the RIGHT of the card is revealed on hover.
+                        # We do NOT need to open a preview panel — just hover & click ↓.
                         doc_card_selectors = [
                             "[data-testid*='document']",
-                            "[data-testid*='file']",
-                            "[class*='document']",
-                            "[class*='artifact']",
+                            "[data-testid*='file-attachment']",
+                            "[data-testid*='attachment']",
+                            "div[class*='document']",
                             "div[class*='Document']",
-                            # Card by visible filename text containing .md
-                            "div:has-text('.md')",
-                            "span:has-text('.md')",
+                            "div[class*='artifact']",
+                            "div[class*='Artifact']",
+                            # Card identified by filename suffix
+                            "div:has(> span:has-text('.md'))",
+                            "div:has(span:has-text('Open file'))",
+                            "div:has(span:has-text('Document'))",
                         ]
-                        card_clicked = False
                         for card_sel in doc_card_selectors:
+                            if file_download_obj:
+                                break
                             try:
                                 card_loc = last_turn_loc.locator(card_sel).first
-                                if await card_loc.count() > 0 and await card_loc.is_visible():
-                                    logger.info("Found document card (%s) — clicking to open preview pane...", card_sel)
-                                    await card_loc.click(timeout=3000)
-                                    card_clicked = True
+                                if await card_loc.count() == 0 or not await card_loc.is_visible():
+                                    continue
+                                logger.info("Found .md document card (%s) — hovering to reveal ↓ button...", card_sel)
+                                await card_loc.hover(timeout=2000)
+                                await asyncio.sleep(0.5)   # wait for hover-reveal animation
+
+                                # The download button is INSIDE or ADJACENT to the card
+                                # Try scoped search first (inside card), then whole-page fallback
+                                dl_btn_selectors = [
+                                    "button[aria-label*='Download']",
+                                    "button[aria-label*='download']",
+                                    "button[title*='Download']",
+                                    "button[title*='download']",
+                                    "[data-testid*='download']",
+                                    "a[download]",
+                                ]
+                                for dl_sel in dl_btn_selectors:
+                                    try:
+                                        # Try scoped first
+                                        dl_loc = card_loc.locator(dl_sel).first
+                                        if await dl_loc.count() == 0 or not await dl_loc.is_visible():
+                                            # Try whole page (button may be rendered outside card DOM)
+                                            dl_loc = page.locator(dl_sel).first
+                                        if await dl_loc.count() > 0 and await dl_loc.is_visible():
+                                            logger.info("Clicking ↓ download button (%s) on card...", dl_sel)
+                                            async with page.expect_download(timeout=12000) as dl_info:
+                                                await dl_loc.click(timeout=3000)
+                                            dl_val = await dl_info.value
+                                            logger.info("Download captured from card button: %s", dl_val.suggested_filename)
+                                            file_download_obj = dl_val
+                                            break
+                                    except Exception as dl_err:
+                                        logger.debug("Card download button %s failed: %s", dl_sel, dl_err)
+                                if file_download_obj:
                                     break
-                            except Exception:
-                                pass
+                            except Exception as card_err:
+                                logger.debug("Card selector %s failed: %s", card_sel, card_err)
 
-                        if card_clicked:
-                            # Wait for the preview/side panel to appear (up to 5 s)
-                            await asyncio.sleep(1.5)
-                            # Look for a download button in the opened preview panel.
-                            # The panel appears as a right-side pane; the download button
-                            # is typically at the top-right of the panel.
-                            preview_download_selectors = [
-                                # Top-right header download button in the preview panel
-                                "button[aria-label*='Download']",
-                                "button[aria-label*='download']",
-                                "button[title*='Download']",
-                                "button[title*='download']",
-                                # Icon-only download buttons (SVG download icon inside button)
-                                "button svg[class*='download']",
-                                # Playwright artifact panel download
-                                "[data-testid*='download']",
-                                "[data-testid='download-button']",
-                                # The download link that may appear in the panel header
-                                "a[download]",
-                                "a[href*='download']",
-                                # Fallback: any visible button near the top of a panel
-                                "header button[aria-label]",
-                                ".panel-header button",
-                                "[role='dialog'] button[aria-label*='Download']",
-                            ]
-                            for dl_sel in preview_download_selectors:
-                                try:
-                                    dl_loc = page.locator(dl_sel).first
-                                    if await dl_loc.count() > 0 and await dl_loc.is_visible():
-                                        logger.info("Found preview-panel download button (%s). Triggering download...", dl_sel)
-                                        async with page.expect_download(timeout=10000) as dl_info:
-                                            await dl_loc.click(timeout=3000)
-                                        dl_val = await dl_info.value
-                                        logger.info("Download captured from preview panel: %s", dl_val.suggested_filename)
-                                        file_download_obj = dl_val
-                                        break
-                                except Exception as dl_err:
-                                    logger.debug("Preview panel download selector %s failed: %s", dl_sel, dl_err)
-
-                        # ── Strategy 2: Inline download link in the chat message ──
+                        # ── Strategy 2: Click the inline "Download …md ↗" text link ──
+                        # ChatGPT often renders a plain text link above the card:
+                        #   "Markdown File: Download XINVORA_...md ↗"
                         if not file_download_obj:
                             try:
-                                file_dl_loc = last_turn_loc.locator("a[download], a[href*='download'], a:has-text('.md')")
-                                if await file_dl_loc.count() > 0 and await file_dl_loc.first.is_visible():
-                                    logger.info("Found inline .md download link. Triggering expect_download()...")
-                                    async with page.expect_download(timeout=8000) as dl_info:
-                                        await file_dl_loc.first.click()
+                                # Scroll & look for the link anywhere in the last turn
+                                link_loc = last_turn_loc.locator(
+                                    "a[href*='.md'], a:has-text('.md'), a[download]"
+                                ).first
+                                if await link_loc.count() > 0 and await link_loc.is_visible():
+                                    logger.info("Found inline .md text link — clicking...")
+                                    async with page.expect_download(timeout=12000) as dl_info:
+                                        await link_loc.click(timeout=3000)
                                     dl_val = await dl_info.value
                                     if dl_val.suggested_filename.lower().endswith((".md", ".txt", ".markdown")):
+                                        logger.info("Inline link download captured: %s", dl_val.suggested_filename)
                                         file_download_obj = dl_val
                             except Exception as dl_err:
-                                logger.debug("Inline file download link failed: %s", dl_err)
+                                logger.debug("Inline text link download failed: %s", dl_err)
 
-                        # Close any preview pane that is still open (press Escape)
-                        try:
-                            await page.keyboard.press("Escape")
-                            await asyncio.sleep(0.3)
-                        except Exception:
-                            pass
-
-                        # ── Strategy 3: Extract markdown text directly from the DOM ──
-                        # Even if no file download was captured, we can scrape the text
-                        # and save it ourselves as a .md file.
+                        # ── Strategy 3: DOM text scrape ──
+                        # Even if no file download was captured, scrape the markdown text
+                        # from the page and save it ourselves — job never fails due to download.
                         md_content = ""
                         try:
                             md_content = await page.evaluate("""() => {
@@ -540,14 +543,14 @@ class ChatGPTController:
                                 if (!turns || turns.length === 0) return '';
                                 const turn = turns[turns.length - 1];
 
-                                // Priority 1: code block content (```yaml / ```markdown)
+                                // Priority 1: code block content (```yaml / ```markdown / ```md)
                                 const codeBlocks = turn.querySelectorAll('pre code');
                                 for (const code of codeBlocks) {
                                     const t = code.innerText.trim();
                                     if (t.length > 50) return t;
                                 }
 
-                                // Priority 2: markdown / prose container
+                                // Priority 2: prose/markdown container
                                 const mdContainer = turn.querySelector('.markdown') ||
                                                    turn.querySelector('[class*="prose"]') ||
                                                    turn;
@@ -555,7 +558,7 @@ class ChatGPTController:
                                 return text.length > 50 ? text : '';
                             }""") or ""
                         except Exception as md_err:
-                            logger.debug("Markdown extraction evaluation failed: %s", md_err)
+                            logger.debug("Markdown text scrape failed: %s", md_err)
 
                         if file_download_obj or (md_content and len(md_content.strip()) >= 20):
                             gen_duration = time.perf_counter() - t_gen_start
@@ -575,6 +578,13 @@ class ChatGPTController:
                 # Branch B: Image Prompt Mode (Default: Job expects photo)
                 # -------------------------------------------------------------
                 else:
+                    # Scroll to bottom so the latest generated image is in view
+                    try:
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
+
                     img_candidates: list[tuple[Locator, str]] = []
                     _known = known_image_srcs or set()
 
