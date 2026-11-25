@@ -315,7 +315,7 @@ class ChatGPTController:
                 pass
             # 2. Check ALL matching #prompt-textarea / contenteditable elements in DOM
             try:
-                return bool(await page.evaluate("""(minLen) => {
+                if await page.evaluate("""(minLen) => {
                     const els = document.querySelectorAll(
                         '#prompt-textarea, [contenteditable="true"][role="textbox"], div[contenteditable="true"].ProseMirror, [contenteditable="true"]'
                     );
@@ -324,9 +324,40 @@ class ChatGPTController:
                         if (txt.length >= minLen) return true;
                     }
                     return false;
-                }""", min_len))
+                }""", min_len):
+                    return True
             except Exception:
-                return False
+                pass
+            # 3. For long prompts (e.g., Prompt 3), ChatGPT converts pasted text
+            #    into an attachment chip ('Adding pasted text...' -> '# PROMPT 3...')
+            #    inside the composer <form> while leaving #prompt-textarea empty.
+            try:
+                prompt_head = prompt_text.strip()[:12]
+                chip_js = """(head) => {
+                    const forms = document.querySelectorAll('form');
+                    for (const form of forms) {
+                        if (!form.querySelector('#prompt-textarea, [contenteditable="true"]')) continue;
+                        const txt = (form.innerText || '').trim();
+                        if (txt.includes('Adding pasted text')) return 'uploading';
+                        if (head && txt.includes(head)) return 'ready';
+                    }
+                    return '';
+                }"""
+                chip_state = await page.evaluate(chip_js, prompt_head)
+                if chip_state == "uploading":
+                    logger.info("Detected pasted-text chip uploading; waiting for ready state...")
+                    t_chip = time.perf_counter()
+                    while (time.perf_counter() - t_chip) < 10.0:
+                        await asyncio.sleep(0.3)
+                        state2 = await page.evaluate(chip_js, prompt_head)
+                        if state2 == "ready":
+                            break
+                    return True
+                if chip_state == "ready":
+                    return True
+            except Exception:
+                pass
+            return False
 
         pasted = False
 
