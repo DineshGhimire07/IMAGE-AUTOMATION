@@ -299,15 +299,31 @@ class ChatGPTController:
 
         # --- STEP 4: Paste prompt in ONE GO (instantaneous, preserves image) ---
         async def _editor_has_text() -> bool:
+            min_len = min(10, len(prompt_text.strip()))
+            # 1. Check the actual located input_loc first
             try:
-                min_len = min(10, len(prompt_text.strip()))
+                txt = (await input_loc.inner_text(timeout=500) or "").strip()
+                if len(txt) >= min_len:
+                    return True
+            except Exception:
+                pass
+            try:
+                txt = (await input_loc.input_value(timeout=500) or "").strip()
+                if len(txt) >= min_len:
+                    return True
+            except Exception:
+                pass
+            # 2. Check ALL matching #prompt-textarea / contenteditable elements in DOM
+            try:
                 return bool(await page.evaluate("""(minLen) => {
-                    const el = document.querySelector('#prompt-textarea') ||
-                               document.querySelector('[contenteditable="true"][role="textbox"]') ||
-                               document.querySelector('[contenteditable="true"]');
-                    if (!el) return false;
-                    const txt = (el.innerText || el.textContent || el.value || '').trim();
-                    return txt.length >= minLen;
+                    const els = document.querySelectorAll(
+                        '#prompt-textarea, [contenteditable="true"][role="textbox"], div[contenteditable="true"].ProseMirror, [contenteditable="true"]'
+                    );
+                    for (const el of els) {
+                        const txt = (el.innerText || el.textContent || el.value || '').trim();
+                        if (txt.length >= minLen) return true;
+                    }
+                    return false;
                 }""", min_len))
             except Exception:
                 return False
@@ -323,7 +339,7 @@ class ChatGPTController:
                         await _focus_composer()
                         await asyncio.sleep(0.15)
                     await page.keyboard.press("Meta+v")
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.35)
                     if await _editor_has_text():
                         pasted = True
                         logger.info("Prompt pasted in one go via native clipboard (Meta+v).")
@@ -331,7 +347,7 @@ class ChatGPTController:
             except Exception as exc:
                 logger.debug("Native pbcopy/Meta+v paste failed: %s", exc)
 
-        # Strategy B: Instant line-by-line insert_text (~10,000+ WPM, 1 CDP call per line)
+        # Strategy B: Line-by-line insert_text (no char-by-char typing)
         if not pasted:
             try:
                 await _focus_composer()
@@ -344,24 +360,9 @@ class ChatGPTController:
                 await asyncio.sleep(0.25)
                 if await _editor_has_text():
                     pasted = True
-                    logger.info("Prompt inserted fast via line-by-line insert_text().")
+                    logger.info("Prompt inserted via line-by-line insert_text().")
             except Exception as exc:
                 logger.debug("Line-by-line insert_text failed: %s", exc)
-
-        # Strategy C: Last-resort line-by-line keyboard.type()
-        if not pasted:
-            logger.warning("Fast paste did not populate editor; falling back to keyboard.type()...")
-            await _focus_composer()
-            lines = prompt_text.split("\n")
-            for i, line in enumerate(lines):
-                if line:
-                    await page.keyboard.type(line, delay=0)
-                if i < len(lines) - 1:
-                    await page.keyboard.press("Shift+Enter")
-            await asyncio.sleep(0.25)
-            if await _editor_has_text():
-                pasted = True
-                logger.debug("Prompt typed via keyboard.type() fallback.")
 
         if not pasted:
             raise ChatGPTControllerError(
