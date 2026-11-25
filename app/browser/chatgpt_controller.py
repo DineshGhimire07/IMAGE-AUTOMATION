@@ -603,7 +603,11 @@ class ChatGPTController:
                         logger.info("MD: Found card at (%.0f, %.0f) — waiting 1s then clicking...", cx, cy)
                         await asyncio.sleep(1.0)
 
-                        # Strategy A: Try the download button on the card itself (visible in DOM)
+                        def _is_image_filename(fname: str) -> bool:
+                            low = (fname or "").lower()
+                            return low.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+
+                        # Strategy A: Try the download button on the latest card (.last, never .first)
                         logger.info("MD: Trying direct card download button...")
                         CARD_DL_SELECTORS = [
                             "[data-testid='download-file-button']",
@@ -618,24 +622,27 @@ class ChatGPTController:
                             if file_download_obj:
                                 break
                             try:
-                                dl_loc = page.locator(dl_sel).first
+                                dl_loc = page.locator(dl_sel).last
                                 if await dl_loc.count() > 0 and await dl_loc.is_visible():
-                                    logger.info("MD: Card dl button (%s) — clicking...", dl_sel)
+                                    logger.info("MD: Card dl button (%s) - clicking .last...", dl_sel)
                                     async with page.expect_download(timeout=15000) as dl_info:
                                         await dl_loc.click(timeout=3000)
-                                    file_download_obj = await dl_info.value
-                                    logger.info("MD: Card-button download: %s",
-                                                file_download_obj.suggested_filename)
+                                    cand = await dl_info.value
+                                    if _is_image_filename(cand.suggested_filename):
+                                        logger.warning("MD: Ignoring image download (%s) in MD mode", cand.suggested_filename)
+                                    else:
+                                        file_download_obj = cand
+                                        logger.info("MD: Card-button download: %s", file_download_obj.suggested_filename)
                             except Exception as e:
                                 logger.debug("MD: card dl btn %s -> %s", dl_sel, e)
 
-                        # Strategy B: Click the card -> preview panel -> panel download button
+                        # Strategy B: Click the card -> preview panel -> panel download button (.last)
                         if not file_download_obj:
                             logger.info("MD: Clicking card to open preview panel...")
                             await page.mouse.click(cx, cy)
                             await asyncio.sleep(2.5)
 
-                            logger.info("MD: Preview open — searching for download button...")
+                            logger.info("MD: Preview open - searching for download button...")
                             PREVIEW_DL_SELECTORS = [
                                 "button[aria-label='Download']",
                                 "button[aria-label*='Download']",
@@ -651,18 +658,21 @@ class ChatGPTController:
                                 if file_download_obj:
                                     break
                                 try:
-                                    dl_loc = page.locator(dl_sel).first
+                                    dl_loc = page.locator(dl_sel).last
                                     if await dl_loc.count() > 0 and await dl_loc.is_visible():
-                                        logger.info("MD: Preview dl button (%s)...", dl_sel)
+                                        logger.info("MD: Preview dl button (%s) .last...", dl_sel)
                                         async with page.expect_download(timeout=15000) as dl_info:
                                             await dl_loc.click(timeout=3000)
-                                        file_download_obj = await dl_info.value
-                                        logger.info("MD: Preview download: %s",
-                                                    file_download_obj.suggested_filename)
+                                        cand = await dl_info.value
+                                        if _is_image_filename(cand.suggested_filename):
+                                            logger.warning("MD: Ignoring image download (%s) in MD mode", cand.suggested_filename)
+                                        else:
+                                            file_download_obj = cand
+                                            logger.info("MD: Preview download: %s", file_download_obj.suggested_filename)
                                 except Exception as e:
                                     logger.debug("MD: preview dl %s -> %s", dl_sel, e)
 
-                            # Strategy C: JS-evaluate click any download button
+                            # Strategy C: JS-evaluate click latest visible download button (reverse order)
                             if not file_download_obj:
                                 logger.info("MD: Trying JS-evaluate download button click...")
                                 try:
@@ -670,7 +680,10 @@ class ChatGPTController:
                                         await page.evaluate("""
                                             () => {
                                                 const btns = Array.from(document.querySelectorAll('button, a'));
-                                                for (const b of btns) {
+                                                for (let i = btns.length - 1; i >= 0; i--) {
+                                                    const b = btns[i];
+                                                    const rect = b.getBoundingClientRect();
+                                                    if (rect.width === 0 || rect.height === 0) continue;
                                                     const lbl = (b.getAttribute('aria-label') || '').toLowerCase();
                                                     const ttl = (b.getAttribute('title') || '').toLowerCase();
                                                     const dtid = (b.getAttribute('data-testid') || '').toLowerCase();
@@ -682,9 +695,12 @@ class ChatGPTController:
                                                 }
                                             }
                                         """)
-                                    file_download_obj = await dl_info.value
-                                    logger.info("MD: JS-click download: %s",
-                                                file_download_obj.suggested_filename)
+                                    cand = await dl_info.value
+                                    if _is_image_filename(cand.suggested_filename):
+                                        logger.warning("MD: Ignoring image download (%s) from JS-click", cand.suggested_filename)
+                                    else:
+                                        file_download_obj = cand
+                                        logger.info("MD: JS-click download: %s", file_download_obj.suggested_filename)
                                 except Exception as e:
                                     logger.debug("MD: JS-click download -> %s", e)
 
