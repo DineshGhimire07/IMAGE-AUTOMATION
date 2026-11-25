@@ -293,6 +293,7 @@ class ChatGPTController:
             except Exception:
                 pass
 
+        await asyncio.sleep(0.35)
         await _focus_composer()
         await asyncio.sleep(0.15)
 
@@ -317,48 +318,39 @@ class ChatGPTController:
         if sys.platform == "darwin":
             try:
                 subprocess.run(["pbcopy"], input=prompt_text.encode("utf-8"), check=True)
-                await page.keyboard.press("Meta+v")
-                await asyncio.sleep(0.25)
-                if await _editor_has_text():
-                    pasted = True
-                    logger.info("Prompt pasted in one go via native clipboard (Meta+v).")
+                for attempt in range(2):
+                    if attempt > 0:
+                        await _focus_composer()
+                        await asyncio.sleep(0.15)
+                    await page.keyboard.press("Meta+v")
+                    await asyncio.sleep(0.3)
+                    if await _editor_has_text():
+                        pasted = True
+                        logger.info("Prompt pasted in one go via native clipboard (Meta+v).")
+                        break
             except Exception as exc:
                 logger.debug("Native pbcopy/Meta+v paste failed: %s", exc)
 
-        # Strategy B: One-shot CDP insert_text (with re-focus)
+        # Strategy B: Instant line-by-line insert_text (~10,000+ WPM, 1 CDP call per line)
         if not pasted:
             try:
                 await _focus_composer()
-                await page.keyboard.insert_text(prompt_text)
+                lines = prompt_text.split("\n")
+                for i, line in enumerate(lines):
+                    if line:
+                        await page.keyboard.insert_text(line)
+                    if i < len(lines) - 1:
+                        await page.keyboard.press("Shift+Enter")
                 await asyncio.sleep(0.25)
                 if await _editor_has_text():
                     pasted = True
-                    logger.info("Prompt inserted in one go via keyboard.insert_text().")
+                    logger.info("Prompt inserted fast via line-by-line insert_text().")
             except Exception as exc:
-                logger.debug("One-shot insert_text failed: %s", exc)
+                logger.debug("Line-by-line insert_text failed: %s", exc)
 
-        # Strategy C: execCommand('insertText') at end (no selectAll/delete)
+        # Strategy C: Last-resort line-by-line keyboard.type()
         if not pasted:
-            try:
-                await _focus_composer()
-                await page.evaluate("""(text) => {
-                    const el = document.querySelector('#prompt-textarea') ||
-                               document.querySelector('[contenteditable="true"][role="textbox"]') ||
-                               document.querySelector('[contenteditable="true"]');
-                    if (!el) return false;
-                    el.focus();
-                    return document.execCommand('insertText', false, text);
-                }""", prompt_text)
-                await asyncio.sleep(0.25)
-                if await _editor_has_text():
-                    pasted = True
-                    logger.info("Prompt inserted in one go via execCommand('insertText').")
-            except Exception as exc:
-                logger.debug("execCommand insertText failed: %s", exc)
-
-        # Strategy D: Last-resort line-by-line keyboard.type()
-        if not pasted:
-            logger.warning("One-shot paste did not populate editor; falling back to keyboard.type()...")
+            logger.warning("Fast paste did not populate editor; falling back to keyboard.type()...")
             await _focus_composer()
             lines = prompt_text.split("\n")
             for i, line in enumerate(lines):
