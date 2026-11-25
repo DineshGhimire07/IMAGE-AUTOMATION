@@ -252,38 +252,62 @@ class ChatGPTController:
         if not input_loc:
             raise ChatGPTControllerError("ChatGPT prompt textarea could not be found.")
 
-        # --- STEP 3: Focus without clearing (image attachment must be preserved!) ---
-        # IMPORTANT: Never use fill(''), Control+a+Delete, execCommand('selectAll'),
-        # or synthetic ClipboardEvent('paste'), as they can clear the image.
-        try:
-            await input_loc.click(timeout=1500)
-        except Exception:
-            logger.debug("Click on prompt input timed out, using direct focus.")
-            await input_loc.focus()
+        # --- STEP 3: Robust focus without clearing (image attachment must be preserved!) ---
+        # On Prompt 2+, overlays/animations can cause normal click(timeout=1500) to fail,
+        # leaving ProseMirror without an active caret so Meta+v / typing goes nowhere.
+        async def _focus_composer() -> None:
+            try:
+                await page.evaluate("""() => {
+                    const el = document.querySelector('#prompt-textarea') ||
+                               document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                               document.querySelector('[contenteditable="true"]');
+                    if (el) el.scrollIntoView({ block: 'center', behavior: 'instant' });
+                }""")
+            except Exception:
+                pass
+            try:
+                await input_loc.click(timeout=2000, force=True)
+            except Exception:
+                try:
+                    box = await input_loc.bounding_box()
+                    if box:
+                        await page.mouse.click(box['x'] + min(30, box['width'] / 2), box['y'] + box['height'] / 2)
+                    else:
+                        await input_loc.focus()
+                except Exception:
+                    await input_loc.focus()
+            try:
+                await page.evaluate("""() => {
+                    const el = document.querySelector('#prompt-textarea') ||
+                               document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                               document.querySelector('[contenteditable="true"]');
+                    if (!el) return;
+                    el.focus();
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    range.collapse(false);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                }""")
+            except Exception:
+                pass
 
-        try:
-            await page.evaluate("""() => {
-                const el = document.querySelector('#prompt-textarea') ||
-                           document.querySelector('[contenteditable="true"][role="textbox"]') ||
-                           document.querySelector('[contenteditable="true"]');
-                if (el) el.focus();
-            }""")
-        except Exception:
-            pass
-
+        await _focus_composer()
         await asyncio.sleep(0.15)
 
         # --- STEP 4: Paste prompt in ONE GO (instantaneous, preserves image) ---
         async def _editor_has_text() -> bool:
             try:
-                return bool(await page.evaluate("""() => {
+                min_len = min(10, len(prompt_text.strip()))
+                return bool(await page.evaluate("""(minLen) => {
                     const el = document.querySelector('#prompt-textarea') ||
                                document.querySelector('[contenteditable="true"][role="textbox"]') ||
                                document.querySelector('[contenteditable="true"]');
                     if (!el) return false;
                     const txt = (el.innerText || el.textContent || el.value || '').trim();
-                    return txt.length > 0;
-                }"""))
+                    return txt.length >= minLen;
+                }""", min_len))
             except Exception:
                 return False
 
@@ -301,10 +325,10 @@ class ChatGPTController:
             except Exception as exc:
                 logger.debug("Native pbcopy/Meta+v paste failed: %s", exc)
 
-        # Strategy B: One-shot CDP insert_text (also instantaneous)
+        # Strategy B: One-shot CDP insert_text (with re-focus)
         if not pasted:
             try:
-                await input_loc.focus()
+                await _focus_composer()
                 await page.keyboard.insert_text(prompt_text)
                 await asyncio.sleep(0.25)
                 if await _editor_has_text():
@@ -313,17 +337,44 @@ class ChatGPTController:
             except Exception as exc:
                 logger.debug("One-shot insert_text failed: %s", exc)
 
-        # Strategy C: Last-resort line-by-line keyboard.type()
+        # Strategy C: execCommand('insertText') at end (no selectAll/delete)
+        if not pasted:
+            try:
+                await _focus_composer()
+                await page.evaluate("""(text) => {
+                    const el = document.querySelector('#prompt-textarea') ||
+                               document.querySelector('[contenteditable="true"][role="textbox"]') ||
+                               document.querySelector('[contenteditable="true"]');
+                    if (!el) return false;
+                    el.focus();
+                    return document.execCommand('insertText', false, text);
+                }""", prompt_text)
+                await asyncio.sleep(0.25)
+                if await _editor_has_text():
+                    pasted = True
+                    logger.info("Prompt inserted in one go via execCommand('insertText').")
+            except Exception as exc:
+                logger.debug("execCommand insertText failed: %s", exc)
+
+        # Strategy D: Last-resort line-by-line keyboard.type()
         if not pasted:
             logger.warning("One-shot paste did not populate editor; falling back to keyboard.type()...")
-            await input_loc.focus()
+            await _focus_composer()
             lines = prompt_text.split("\n")
             for i, line in enumerate(lines):
                 if line:
                     await page.keyboard.type(line, delay=0)
                 if i < len(lines) - 1:
                     await page.keyboard.press("Shift+Enter")
-            logger.debug("Prompt typed via keyboard.type() fallback.")
+            await asyncio.sleep(0.25)
+            if await _editor_has_text():
+                pasted = True
+                logger.debug("Prompt typed via keyboard.type() fallback.")
+
+        if not pasted:
+            raise ChatGPTControllerError(
+                "Prompt text could not be entered into ChatGPT composer - aborting send to avoid sending image only."
+            )
 
         await asyncio.sleep(0.3)
 
